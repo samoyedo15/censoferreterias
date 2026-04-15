@@ -1,0 +1,388 @@
+"""
+Enriquecimiento con IA — Censo de Ferreterías Argos
+v2.0 — Batch processing + validación + guardado incremental
+Beca Ser ANDI · EAFIT
+"""
+
+import os
+import time
+import json
+import re
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
+
+# ── Credenciales ───────────────────────────────────────────────────────────────
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    raise ValueError("GEMINI_API_KEY no encontrada en .env")
+
+client   = genai.Client(api_key=api_key)
+MODEL_ID = "gemini-2.5-flash"
+
+# ── Configuración ──────────────────────────────────────────────────────────────
+ARCHIVO_ENTRADA   = "piloto_girardota_raw.csv"   # cambia si tu CSV tiene otro nombre
+ARCHIVO_PROGRESO  = "enriquecimiento_progreso.json"
+ARCHIVO_SALIDA    = "ferreterias_enriquecidas.csv"
+ARCHIVO_EXCEL     = "nueva base de datos enriquecida.xlsx"
+TAMANO_BATCH      = 8    # registros por llamada de IA (balance velocidad/costo)
+DELAY_ENTRE_BATCH = 1.5  # segundos entre llamadas
+
+
+# ── Clasificación por reglas (sin IA) ─────────────────────────────────────────
+# Corre ANTES de la IA para los casos obvios — ahorra llamadas y costo
+PALABRAS_INDUSTRIAL = [
+    "industrial", "distribuidora", "depósito", "deposito", "mayorista",
+    "centro de distribución", "distribución", "comercializadora", "almacén"
+]
+PALABRAS_ESPECIALISTA = [
+    "construcción", "construccion", "materiales", "pinturas", "acabados",
+    "eléctrico", "electrico", "plomería", "plomeria", "cerrajería", "vidrios"
+]
+PALABRAS_MINORISTA = [
+    "hogar", "variedades", "miscelánea", "miscelanea", "express",
+    "miniferretería", "mini"
+]
+
+def clasificar_por_reglas(nombre: str, categorias: str) -> dict | None:
+    """
+    Clasificación rápida sin IA basada en palabras clave.
+    Retorna None si no hay certeza — pasa a la IA.
+    """
+    texto = (nombre + " " + str(categorias)).lower()
+
+    if any(p in texto for p in PALABRAS_INDUSTRIAL):
+        return {
+            "segmento":              "Distribuidor_Industrial",
+            "infraestructura_pesada": True,
+            "nivel_madurez":         3,
+            "clasificado_por":       "reglas"
+        }
+    if any(p in texto for p in PALABRAS_ESPECIALISTA):
+        return {
+            "segmento":              "Especialista_Obra",
+            "infraestructura_pesada": True,
+            "nivel_madurez":         2,
+            "clasificado_por":       "reglas"
+        }
+    if any(p in texto for p in PALABRAS_MINORISTA):
+        return {
+            "segmento":              "Minorista_Hogar",
+            "infraestructura_pesada": False,
+            "nivel_madurez":         1,
+            "clasificado_por":       "reglas"
+        }
+    return None  # no hay certeza → usar IA
+
+
+# ── Limpieza de nombre ────────────────────────────────────────────────────────
+RUIDOS = [
+    r"\bS\.A\.S\.?\b", r"\bLtda\.?\b", r"\bS\.A\.?\b", r"\bE\.U\.?\b",
+    r"\bCía\.?\b", r"\b& Cía\b", r"\bHermanos\b", r"\bHnos\.?\b",
+    r",?\s*(Bogotá|Medellín|Cali|Barranquilla|Cartagena|Santa Marta)[^,]*",
+    r"\s{2,}"
+]
+
+def limpiar_nombre(nombre: str) -> str:
+    """Elimina formas legales y ciudades del nombre comercial."""
+    resultado = nombre
+    for patron in RUIDOS:
+        resultado = re.sub(patron, " ", resultado, flags=re.IGNORECASE)
+    return resultado.strip(" ,.-")
+
+
+# ── Validación del JSON de IA ──────────────────────────────────────────────────
+SEGMENTOS_VALIDOS = {"Minorista_Hogar", "Especialista_Obra", "Distribuidor_Industrial"}
+MADUREZ_VALIDOS   = {1, 2, 3}
+
+def validar_resultado_ia(resultado: dict) -> dict:
+    """
+    Valida y corrige los campos del JSON retornado por la IA.
+    Nunca deja un campo inválido pasar al dataset final.
+    """
+    # Segmento
+    if resultado.get("segmento") not in SEGMENTOS_VALIDOS:
+        resultado["segmento"] = "Minorista_Hogar"
+
+    # Infraestructura pesada
+    if not isinstance(resultado.get("infraestructura_pesada"), bool):
+        val = str(resultado.get("infraestructura_pesada", "")).lower()
+        resultado["infraestructura_pesada"] = val in ("true", "1", "sí", "si", "yes")
+
+    # Nivel de madurez
+    try:
+        nivel = int(resultado.get("nivel_madurez", 1))
+        resultado["nivel_madurez"] = nivel if nivel in MADUREZ_VALIDOS else 1
+    except (ValueError, TypeError):
+        resultado["nivel_madurez"] = 1
+
+    # Nombre limpio
+    if not resultado.get("nombre_comercial_limpio"):
+        resultado["nombre_comercial_limpio"] = ""
+
+    resultado["clasificado_por"] = "ia"
+    return resultado
+
+
+# ── Prompt para batch ─────────────────────────────────────────────────────────
+def construir_prompt_batch(registros: list[dict]) -> str:
+    """
+    Genera un prompt para clasificar varios registros en una sola llamada.
+    Incluye ejemplos concretos para guiar a la IA.
+    """
+    lista_negocios = ""
+    for i, r in enumerate(registros):
+        lista_negocios += (
+            f"\n{i+1}. Nombre: {r['nombre']} | "
+            f"Dirección: {r.get('direccion','')} | "
+            f"Rating: {r.get('rating','Sin rating')} | "
+            f"Reseñas: {r.get('num_resenas','?')} | "
+            f"Tipo Google: {r.get('tipo_negocio','')}"
+        )
+
+    return f"""
+Eres un experto en inteligencia de mercados del sector ferretero colombiano.
+Trabajas para Cementos Argos clasificando ferreterías para su red de distribución.
+
+Clasifica EXACTAMENTE {len(registros)} negocios y responde SOLO con un array JSON.
+Sin texto adicional, sin markdown, sin explicaciones.
+
+CRITERIOS DE CLASIFICACIÓN:
+- Minorista_Hogar: Tienda pequeña, barrial, vende al consumidor final. Menos de 3 empleados visibles, sin acceso para camiones.
+- Especialista_Obra: Ferretería mediana con sección de construcción. Atiende contratistas y obras pequeñas. Puede recibir pallets.
+- Distribuidor_Industrial: Gran almacén, bodega o depósito. Vende por mayor, tiene montacargas o zona de carga. Rating alto con muchas reseñas.
+
+CRITERIOS DE INFRAESTRUCTURA PESADA (true si puede recibir camión de 5+ toneladas):
+- true: palabras como depósito, distribuidora, materiales, almacén, mayorista, industrial
+- false: express, mini, hogar, variedades, miscelánea, pequeño local
+
+CRITERIOS DE NIVEL DE MADUREZ:
+- 1 (Local pequeño): menos de 50 reseñas o rating < 3.5
+- 2 (Almacén mediano): 50-200 reseñas o rating 3.5-4.2
+- 3 (Centro distribución): más de 200 reseñas o rating > 4.2 con nombre de empresa grande
+
+EJEMPLOS CORRECTOS:
+[
+  {{"nombre_comercial_limpio": "Ferretería El Constructor", "segmento": "Especialista_Obra", "infraestructura_pesada": true, "nivel_madurez": 2}},
+  {{"nombre_comercial_limpio": "Ferretería Express", "segmento": "Minorista_Hogar", "infraestructura_pesada": false, "nivel_madurez": 1}},
+  {{"nombre_comercial_limpio": "Distribuidora Industrial del Norte", "segmento": "Distribuidor_Industrial", "infraestructura_pesada": true, "nivel_madurez": 3}}
+]
+
+NEGOCIOS A CLASIFICAR:
+{lista_negocios}
+
+Responde con exactamente {len(registros)} objetos JSON en un array. Mismo orden que la lista.
+"""
+
+
+# ── Llamada a la IA por batch ─────────────────────────────────────────────────
+def clasificar_batch(registros: list[dict]) -> list[dict | None]:
+    """
+    Envía un batch a Gemini y retorna lista de resultados validados.
+    Cada resultado corresponde al registro en la misma posición.
+    """
+    prompt = construir_prompt_batch(registros)
+
+    for intento in range(1, 4):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+
+            # Limpiar respuesta por si Gemini agrega texto extra
+            texto = response.text.strip()
+            texto = re.sub(r"^```json\s*", "", texto)
+            texto = re.sub(r"\s*```$", "", texto)
+
+            resultados_raw = json.loads(texto)
+
+            # Validar que sea lista del tamaño correcto
+            if not isinstance(resultados_raw, list):
+                resultados_raw = [resultados_raw]
+
+            resultados = []
+            for r in resultados_raw[:len(registros)]:
+                resultados.append(validar_resultado_ia(r))
+
+            # Rellenar si la IA devolvió menos items que los enviados
+            while len(resultados) < len(registros):
+                resultados.append({
+                    "nombre_comercial_limpio": "",
+                    "segmento":               "Minorista_Hogar",
+                    "infraestructura_pesada":  False,
+                    "nivel_madurez":           1,
+                    "clasificado_por":         "fallback"
+                })
+
+            return resultados
+
+        except json.JSONDecodeError:
+            print(f"    JSON inválido (intento {intento}/3) — reintentando...")
+        except Exception as e:
+            print(f"    Error IA (intento {intento}/3): {e}")
+
+        time.sleep(2 * intento)
+
+    # Si fallan todos los intentos, retornar fallbacks
+    return [{
+        "nombre_comercial_limpio": limpiar_nombre(r["nombre"]),
+        "segmento":               "Minorista_Hogar",
+        "infraestructura_pesada":  False,
+        "nivel_madurez":           1,
+        "clasificado_por":         "fallback_error"
+    } for r in registros]
+
+
+# ── Guardar Excel final ───────────────────────────────────────────────────────
+def guardar_excel_final(df: pd.DataFrame):
+    from openpyxl.utils import get_column_letter
+
+    with pd.ExcelWriter(ARCHIVO_EXCEL, engine="openpyxl") as writer:
+
+        # Hoja 1: Dataset completo enriquecido
+        df.to_excel(writer, sheet_name="Ferreterías", index=False)
+        ws = writer.sheets["Ferreterías"]
+        for i, col in enumerate(df.columns, 1):
+            ws.column_dimensions[get_column_letter(i)].width = 22
+
+        # Hoja 2: Solo distribuidores industriales (los más valiosos para Argos)
+        industriales = df[df["segmento"] == "Distribuidor_Industrial"]
+        industriales.to_excel(writer, sheet_name="Distribuidores industriales", index=False)
+
+        # Hoja 3: Resumen por ciudad y segmento
+        resumen = df.groupby(["ciudad", "segmento"]).size().unstack(fill_value=0).reset_index()
+        resumen.to_excel(writer, sheet_name="Segmentos por ciudad", index=False)
+
+        # Hoja 4: Resumen de madurez
+        madurez = df.groupby(["ciudad", "nivel_madurez"]).size().unstack(fill_value=0).reset_index()
+        madurez.to_excel(writer, sheet_name="Madurez por ciudad", index=False)
+
+    print(f"Excel guardado: {ARCHIVO_EXCEL}")
+
+
+# ── Pipeline principal ─────────────────────────────────────────────────────────
+def ejecutar():
+    # Cargar datos
+    if not os.path.exists(ARCHIVO_ENTRADA):
+        print(f"No se encontró {ARCHIVO_ENTRADA}")
+        print("Archivos CSV disponibles en esta carpeta:")
+        for f in os.listdir("."):
+            if f.endswith(".csv"):
+                print(f"  - {f}")
+        return
+
+    df = pd.read_csv(ARCHIVO_ENTRADA, encoding="utf-8-sig")
+    print(f"Registros cargados: {len(df)}")
+
+    # Cargar progreso previo
+    enriquecidos = {}
+    if os.path.exists(ARCHIVO_PROGRESO):
+        with open(ARCHIVO_PROGRESO, "r", encoding="utf-8") as f:
+            enriquecidos = json.load(f)
+        print(f"Progreso previo: {len(enriquecidos)} ya procesados")
+
+    # ── PASO 1: Clasificar por reglas (gratis, instantáneo) ───────────────────
+    print("\nPASO 1: Clasificación por reglas...")
+    por_reglas = 0
+    pendientes_ia = []
+
+    for _, row in df.iterrows():
+        pid = str(row.get("place_id", row.get("nombre", "")))
+        if pid in enriquecidos:
+            continue
+
+        clasif = clasificar_por_reglas(
+            row.get("nombre", ""),
+            row.get("categorias_google", "")
+        )
+        if clasif:
+            enriquecidos[pid] = {
+                "nombre_comercial_limpio": limpiar_nombre(row["nombre"]),
+                **clasif
+            }
+            por_reglas += 1
+        else:
+            pendientes_ia.append(row)
+
+    print(f"  Clasificados por reglas: {por_reglas}")
+    print(f"  Pendientes para IA:      {len(pendientes_ia)}")
+
+    # ── PASO 2: Clasificar con IA en batches ──────────────────────────────────
+    if pendientes_ia:
+        total_batches = (len(pendientes_ia) + TAMANO_BATCH - 1) // TAMANO_BATCH
+        print(f"\nPASO 2: Clasificación IA ({total_batches} batches de {TAMANO_BATCH})...")
+
+        for i in range(0, len(pendientes_ia), TAMANO_BATCH):
+            batch    = pendientes_ia[i:i + TAMANO_BATCH]
+            num      = i // TAMANO_BATCH + 1
+            pct      = (num / total_batches) * 100
+
+            print(f"  Batch {num}/{total_batches} ({pct:.0f}%) — {len(batch)} registros")
+
+            resultados = clasificar_batch([r.to_dict() for r in batch])
+
+            for row, resultado in zip(batch, resultados):
+                pid = str(row.get("place_id", row.get("nombre", "")))
+                enriquecidos[pid] = resultado
+
+            # Guardar progreso cada 5 batches
+            if num % 5 == 0:
+                with open(ARCHIVO_PROGRESO, "w", encoding="utf-8") as f:
+                    json.dump(enriquecidos, f, ensure_ascii=False)
+
+            time.sleep(DELAY_ENTRE_BATCH)
+
+    # Guardado final del progreso
+    with open(ARCHIVO_PROGRESO, "w", encoding="utf-8") as f:
+        json.dump(enriquecidos, f, ensure_ascii=False)
+
+    # ── PASO 3: Unir con el dataset original ──────────────────────────────────
+    print("\nPASO 3: Uniendo resultados...")
+
+    cols_ia = ["nombre_comercial_limpio", "segmento",
+               "infraestructura_pesada", "nivel_madurez", "clasificado_por"]
+
+    for col in cols_ia:
+        df[col] = ""
+
+    for i, row in df.iterrows():
+        pid = str(row.get("place_id", row.get("nombre", "")))
+        if pid in enriquecidos:
+            for col in cols_ia:
+                df.at[i, col] = enriquecidos[pid].get(col, "")
+
+    # Limpiar nombres que no pasaron por IA
+    mask_vacio = df["nombre_comercial_limpio"] == ""
+    df.loc[mask_vacio, "nombre_comercial_limpio"] = df.loc[mask_vacio, "nombre"].apply(limpiar_nombre)
+
+    # ── PASO 4: Guardar resultados ────────────────────────────────────────────
+    df.to_csv(ARCHIVO_SALIDA, index=False, encoding="utf-8-sig")
+    guardar_excel_final(df)
+
+    # ── Reporte final ─────────────────────────────────────────────────────────
+    print(f"\n{'='*55}")
+    print("REPORTE DE ENRIQUECIMIENTO")
+    print(f"Total registros:         {len(df)}")
+    print(f"Clasificados por reglas: {(df['clasificado_por']=='reglas').sum()}")
+    print(f"Clasificados por IA:     {(df['clasificado_por']=='ia').sum()}")
+    print(f"Fallback (error):        {(df['clasificado_por']=='fallback_error').sum()}")
+    print()
+    print("Distribución por segmento:")
+    print(df["segmento"].value_counts().to_string())
+    print()
+    print("Distribución por nivel de madurez:")
+    print(df["nivel_madurez"].value_counts().sort_index().to_string())
+    print()
+    print("Infraestructura pesada:")
+    print(df["infraestructura_pesada"].value_counts().to_string())
+    print(f"\nArchivos generados:")
+    print(f"  CSV:   {ARCHIVO_SALIDA}")
+    print(f"  Excel: {ARCHIVO_EXCEL}")
+
+
+if __name__ == "__main__":
+    ejecutar()

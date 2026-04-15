@@ -1,0 +1,99 @@
+import requests
+import os
+import time
+import pandas as pd
+from dotenv import load_dotenv
+
+# 1. Carga de credenciales
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_MAPS_KEY")
+
+if not API_KEY:
+    raise ValueError("Error: No se encontró la API_KEY en el archivo .env")
+
+# 2. Configuración específica para el piloto en Girardota
+TERMINOS = ["ferretería", "depósito de materiales", "materiales de construcción"]
+
+# Ajuste: Solo Girardota y sus sectores principales para la prueba
+ZONAS = {
+    "Girardota": ["Centro", "Zona Industrial", "Vereda El Hatillo"]
+}
+
+def consultar_api_google(query, ciudad_ref):
+    """Realiza la petición a la API con filtro de estado operativo."""
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": API_KEY,
+        "X-Goog-FieldMask": (
+            "places.displayName,places.formattedAddress,places.location,"
+            "places.nationalPhoneNumber,places.websiteUri,places.rating,"
+            "places.id,places.businessStatus"
+        )
+    }
+    
+    body = {
+        "textQuery": query,
+        "languageCode": "es",
+        "maxResultCount": 20
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        data = response.json()
+        lugares = data.get("places", [])
+        
+        resultados = []
+        for lugar in lugares:
+            status = lugar.get("businessStatus", "")
+            if status != "OPERATIONAL":
+                continue
+            
+            resultados.append({
+                "nombre":    lugar.get("displayName", {}).get("text", ""),
+                "ciudad":    ciudad_ref,
+                "direccion": lugar.get("formattedAddress", ""),
+                "telefono":  lugar.get("nationalPhoneNumber", ""),
+                "website":   lugar.get("websiteUri", ""),
+                "lat":       lugar.get("location", {}).get("latitude", ""),
+                "lng":       lugar.get("location", {}).get("longitude", ""),
+                "rating":    lugar.get("rating", ""),
+                "status":    status,
+                "place_id":  lugar.get("id", ""),
+                "fuente":    "google_maps_api_v1"
+            })
+        return resultados
+    except Exception as e:
+        print(f"Error en consulta '{query}': {e}")
+        return []
+
+def ejecutar_recoleccion():
+    """Ejecuta la recolección para el piloto."""
+    dataset_final = {}
+    print(f"Iniciando piloto en {list(ZONAS.keys())[0]}...")
+    
+    for ciudad, sub_zonas in ZONAS.items():
+        for zona in sub_zonas:
+            for termino in TERMINOS:
+                query = f"{termino} en {zona}, {ciudad}, Colombia"
+                print(f"  > Buscando: {query}")
+                
+                encontrados = consultar_api_google(query, ciudad)
+                for r in encontrados:
+                    dataset_final[r['place_id']] = r
+                
+                time.sleep(1.2) 
+
+    if dataset_final:
+        df = pd.DataFrame(list(dataset_final.values()))
+        nombre_archivo = "piloto_girardota_raw.csv"
+        df.to_csv(nombre_archivo, index=False, encoding='utf-8-sig')
+        print(f"\n--- PILOTO COMPLETADO ---")
+        print(f"Registros únicos: {len(df)}")
+        print(f"Archivo generado: {nombre_archivo}")
+    else:
+        print("No se encontraron registros.")
+
+if __name__ == "__main__":
+    ejecutar_recoleccion()
