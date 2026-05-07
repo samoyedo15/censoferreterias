@@ -1,0 +1,423 @@
+"""
+Colector de ferreterias — Antioquia dirigido por municipios Argos
+Ciudades guardadas con nombre correcto via NOMBRES_CIUDAD
+Sin tildes en prints para evitar errores de encoding
+Beca Ser ANDI · EAFIT
+"""
+
+import requests
+import os
+import time
+import pandas as pd
+from dotenv import load_dotenv
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font
+
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_MAPS_KEY")
+if not API_KEY:
+    raise ValueError("GOOGLE_MAPS_KEY no encontrada en .env")
+
+TERMINOS = [
+    "ferreteria",
+    "deposito de materiales",
+    "ferreteria y deposito",
+    "distribuidora de materiales de construccion"
+]
+
+ZONAS = {
+    "Medellin":              ["Medellin Antioquia"],
+    "Medellin Sur":          ["Guayabal Medellin Antioquia"],
+    "Medellin Norte":        ["Castilla Medellin Antioquia"],
+    "Medellin Occidente":    ["San Javier Medellin Antioquia"],
+    "Medellin Centro":       ["Centro Medellin Antioquia"],
+    "Itagui":                ["Itagui Antioquia"],
+    "Envigado":              ["Envigado Antioquia"],
+    "Sabaneta":              ["Sabaneta Antioquia"],
+    "Caldas":                ["Caldas Antioquia"],
+    "La Estrella":           ["La Estrella Antioquia"],
+    "Bello":                 ["Bello Antioquia"],
+    "Rionegro":              ["Rionegro Antioquia"],
+    "Guarne":                ["Guarne Antioquia"],
+    "Marinilla":             ["Marinilla Antioquia"],
+    "La Ceja":               ["La Ceja Antioquia"],
+    "El Carmen de Viboral":  ["El Carmen de Viboral Antioquia"],
+    "El Penol":              ["El Penol Antioquia"],
+    "San Rafael":            ["San Rafael Antioquia"],
+    "San Carlos":            ["San Carlos Antioquia"],
+    "Alejandria":            ["Alejandria Antioquia"],
+    "Guatape":               ["Guatape Antioquia"],
+    "Santa Rosa de Osos":    ["Santa Rosa de Osos Antioquia"],
+    "Yarumal":               ["Yarumal Antioquia"],
+    "Donmatias":             ["Donmatias Antioquia"],
+    "San Pedro":             ["San Pedro de los Milagros Antioquia"],
+    "Entrerrios":            ["Entrerrios Antioquia"],
+    "Concepcion":            ["Concepcion Antioquia"],
+    "Toledo":                ["Toledo Antioquia"],
+    "Guadalupe":             ["Guadalupe Antioquia"],
+    "Santa Fe de Antioquia": ["Santa Fe de Antioquia Antioquia"],
+    "Urrao":                 ["Urrao Antioquia"],
+    "Frontino":              ["Frontino Antioquia"],
+    "Dabeiba":               ["Dabeiba Antioquia"],
+    "Giraldo":               ["Giraldo Antioquia"],
+    "Liborina":              ["Liborina Antioquia"],
+    "Uramita":               ["Uramita Antioquia"],
+    "Ebejiico":              ["Ebejiico Antioquia"],
+    "Sabanalarga":           ["Sabanalarga Antioquia"],
+    "Apartado":              ["Apartado Antioquia"],
+    "Turbo":                 ["Turbo Antioquia"],
+    "Chigorodo":             ["Chigorodo Antioquia"],
+    "Puerto Berrio":         ["Puerto Berrio Antioquia"],
+    "Remedios":              ["Remedios Antioquia"],
+    "Zaragoza":              ["Zaragoza Antioquia"],
+    "El Bagre":              ["El Bagre Antioquia"],
+    "Segovia":               ["Segovia Antioquia"],
+    "Caucasia":              ["Caucasia Antioquia"],
+    "Sonson":                ["Sonson Antioquia"],
+    "Narino":                ["Narino Antioquia"],
+    "San Luis":              ["San Luis Antioquia"],
+    "Argelia":               ["Argelia Antioquia"],
+    "Doradal":               ["Doradal Antioquia"],
+    "Ituango":               ["Ituango Antioquia"],
+    "La Cruzada":            ["La Cruzada Antioquia"],
+    "San Diego":             ["San Diego Antioquia"],
+}
+
+# Mapeo de clave interna -> nombre correcto que se guarda en el CSV
+# Evita que la ciudad quede truncada como "San", "La", "El"
+NOMBRES_CIUDAD = {
+    "Medellin":              "Medellin",
+    "Medellin Sur":          "Medellin",
+    "Medellin Norte":        "Medellin",
+    "Medellin Occidente":    "Medellin",
+    "Medellin Centro":       "Medellin",
+    "Itagui":                "Itagui",
+    "Envigado":              "Envigado",
+    "Sabaneta":              "Sabaneta",
+    "Caldas":                "Caldas",
+    "La Estrella":           "La Estrella",
+    "Bello":                 "Bello",
+    "Rionegro":              "Rionegro",
+    "Guarne":                "Guarne",
+    "Marinilla":             "Marinilla",
+    "La Ceja":               "La Ceja",
+    "El Carmen de Viboral":  "El Carmen de Viboral",
+    "El Penol":              "El Penol",
+    "San Rafael":            "San Rafael",
+    "San Carlos":            "San Carlos",
+    "Alejandria":            "Alejandria",
+    "Guatape":               "Guatape",
+    "Santa Rosa de Osos":    "Santa Rosa de Osos",
+    "Yarumal":               "Yarumal",
+    "Donmatias":             "Donmatias",
+    "San Pedro":             "San Pedro de los Milagros",
+    "Entrerrios":            "Entrerrios",
+    "Concepcion":            "Concepcion",
+    "Toledo":                "Toledo",
+    "Guadalupe":             "Guadalupe",
+    "Santa Fe de Antioquia": "Santa Fe de Antioquia",
+    "Urrao":                 "Urrao",
+    "Frontino":              "Frontino",
+    "Dabeiba":               "Dabeiba",
+    "Giraldo":               "Giraldo",
+    "Liborina":              "Liborina",
+    "Uramita":               "Uramita",
+    "Ebejiico":              "Ebejiico",
+    "Sabanalarga":           "Sabanalarga",
+    "Apartado":              "Apartado",
+    "Turbo":                 "Turbo",
+    "Chigorodo":             "Chigorodo",
+    "Puerto Berrio":         "Puerto Berrio",
+    "Remedios":              "Remedios",
+    "Zaragoza":              "Zaragoza",
+    "El Bagre":              "El Bagre",
+    "Segovia":               "Segovia",
+    "Caucasia":              "Caucasia",
+    "Sonson":                "Sonson",
+    "Narino":                "Narino",
+    "San Luis":              "San Luis",
+    "Argelia":               "Argelia",
+    "Doradal":               "Doradal",
+    "Ituango":               "Ituango",
+    "La Cruzada":            "La Cruzada",
+    "San Diego":             "San Diego",
+}
+
+NOMBRE_CSV   = "piloto_antioquia_argos_raw.csv"
+NOMBRE_EXCEL = "piloto_antioquia_argos_raw.xlsx"
+
+CATEGORIAS_VALIDAS = {
+    "hardware_store", "home_improvement_store",
+    "building_materials_store", "lumber_yard",
+    "paint_store", "plumbing_supply_store",
+    "electrical_supply_store", "wholesale", "warehouse",
+}
+
+PALABRAS_VALIDAS = [
+    "ferret", "deposito", "materiales", "construc",
+    "pinturas", "distribu", "almacen", "hierros",
+    "aceros", "cemento", "cementos", "ferreelec",
+    "ladrillo", "plomer", "tubos", "agroferret",
+    "drirefor", "dryrefor", "ferkatio", "ferregal",
+    "construrama", "homecenter",
+]
+
+PALABRAS_EXCLUIR = [
+    "supermercado", "drogueria", "restaurante",
+    "comida", "cocina", "centro comercial",
+    "clinica", "hospital", "colegio", "escuela",
+    "peluqueria", "spa", "hotel", "motel",
+    "pizzeria", "papeleria", "libreria",
+]
+
+FIELD_MASK = ",".join([
+    "places.id", "places.displayName",
+    "places.formattedAddress", "places.shortFormattedAddress",
+    "places.addressComponents", "places.location",
+    "places.nationalPhoneNumber", "places.internationalPhoneNumber",
+    "places.websiteUri", "places.rating", "places.userRatingCount",
+    "places.businessStatus", "places.primaryTypeDisplayName",
+    "places.types", "places.editorialSummary",
+    "places.regularOpeningHours", "places.priceLevel",
+])
+
+
+def es_negocio_valido(nombre, tipos):
+    nombre_lower = nombre.lower()
+    if any(p in nombre_lower for p in PALABRAS_EXCLUIR):
+        return False
+    if any(t in CATEGORIAS_VALIDAS for t in tipos):
+        return True
+    if any(p in nombre_lower for p in PALABRAS_VALIDAS):
+        return True
+    return False
+
+
+def extraer_barrio(components):
+    if not components:
+        return ""
+    for tipo in ["neighborhood", "sublocality_level_1", "sublocality"]:
+        for c in components:
+            if tipo in c.get("types", []):
+                return c.get("longText", "")
+    return ""
+
+
+def consultar_api(query, ciudad_key):
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": API_KEY,
+        "X-Goog-FieldMask": FIELD_MASK
+    }
+    body = {
+        "textQuery": query,
+        "languageCode": "es",
+        "maxResultCount": 20
+    }
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        resultados = []
+        rechazados = 0
+
+        # Ciudad correcta del diccionario — nunca truncada
+        ciudad_limpia = NOMBRES_CIUDAD.get(ciudad_key, ciudad_key)
+
+        for lugar in data.get("places", []):
+            if lugar.get("businessStatus") != "OPERATIONAL":
+                continue
+
+            tipos  = lugar.get("types", [])
+            nombre = lugar.get("displayName", {}).get("text", "")
+
+            if not es_negocio_valido(nombre, tipos):
+                rechazados += 1
+                continue
+
+            comps   = lugar.get("addressComponents", [])
+            horario = lugar.get("regularOpeningHours", {})
+
+            resultados.append({
+                "nombre":            nombre,
+                "place_id":          lugar.get("id", ""),
+                "ciudad":            ciudad_limpia,
+                "barrio":            extraer_barrio(comps),
+                "direccion":         lugar.get("formattedAddress", ""),
+                "direccion_corta":   lugar.get("shortFormattedAddress", ""),
+                "lat":               lugar.get("location", {}).get("latitude", ""),
+                "lng":               lugar.get("location", {}).get("longitude", ""),
+                "telefono":          lugar.get("nationalPhoneNumber", ""),
+                "telefono_intl":     lugar.get("internationalPhoneNumber", ""),
+                "website":           lugar.get("websiteUri", ""),
+                "rating":            lugar.get("rating", ""),
+                "num_resenas":       lugar.get("userRatingCount", ""),
+                "nivel_precio":      lugar.get("priceLevel", ""),
+                "tipo_negocio":      lugar.get("primaryTypeDisplayName", {}).get("text", ""),
+                "categorias_google": ", ".join(tipos),
+                "descripcion":       lugar.get("editorialSummary", {}).get("text", ""),
+                "horario":           " | ".join(horario.get("weekdayDescriptions", [])),
+                "status":            lugar.get("businessStatus", ""),
+                "fuente":            "google_maps_v2",
+            })
+
+        return resultados, rechazados
+
+    except Exception as e:
+        print(f"  Error en '{query}': {e}")
+        return [], 0
+
+
+def guardar_excel(df):
+    AZUL     = PatternFill("solid", fgColor="BDD7EE")
+    VERDE    = PatternFill("solid", fgColor="C6EFCE")
+    AMARILLO = PatternFill("solid", fgColor="FFEB9C")
+
+    anchos = {
+        "nombre": 35, "place_id": 30, "ciudad": 25,
+        "barrio": 22, "direccion": 45, "lat": 14, "lng": 14,
+        "telefono": 18, "website": 35, "rating": 10,
+        "num_resenas": 14, "tipo_negocio": 25,
+        "categorias_google": 35, "descripcion": 50,
+        "horario": 60,
+    }
+
+    with pd.ExcelWriter(NOMBRE_EXCEL, engine="openpyxl") as writer:
+
+        df.to_excel(writer, sheet_name="Ferreterias", index=False)
+        ws = writer.sheets["Ferreterias"]
+        for cell in ws[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        for i, col in enumerate(df.columns, 1):
+            ws.column_dimensions[get_column_letter(i)].width = anchos.get(col, 20)
+        col_tel = list(df.columns).index("telefono") + 1
+        for row_idx in range(2, len(df) + 2):
+            if not str(ws.cell(row_idx, col_tel).value or "").strip():
+                ws.cell(row_idx, col_tel).fill = AMARILLO
+
+        por_ciudad = df.groupby("ciudad").agg(
+            total=("nombre", "count"),
+            con_telefono=("telefono", lambda x: (x.fillna("") != "").sum()),
+            rating_prom=("rating", lambda x:
+                round(pd.to_numeric(x, errors="coerce").mean(), 2))
+        ).reset_index().sort_values("total", ascending=False)
+        por_ciudad.to_excel(writer, sheet_name="Por municipio", index=False)
+        ws2 = writer.sheets["Por municipio"]
+        for cell in ws2[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        ws2.column_dimensions["A"].width = 28
+
+        sin_tel = df[df["telefono"].fillna("") == ""][
+            ["nombre", "ciudad", "barrio", "direccion",
+             "website", "rating", "num_resenas", "place_id"]
+        ]
+        sin_tel.to_excel(writer, sheet_name="Sin telefono", index=False)
+        ws3 = writer.sheets["Sin telefono"]
+        for cell in ws3[1]:
+            cell.fill = AMARILLO
+            cell.font = Font(bold=True)
+
+        resumen = pd.DataFrame({
+            "Indicador": [
+                "Total ferreterias unicas",
+                "Municipios cubiertos",
+                "Con telefono",
+                "Sin telefono",
+                "Con descripcion",
+                "Rating promedio",
+            ],
+            "Valor": [
+                len(df),
+                df["ciudad"].nunique(),
+                (df["telefono"].fillna("") != "").sum(),
+                (df["telefono"].fillna("") == "").sum(),
+                (df["descripcion"].fillna("") != "").sum(),
+                round(pd.to_numeric(df["rating"], errors="coerce").mean(), 2),
+            ]
+        })
+        resumen.to_excel(writer, sheet_name="Resumen", index=False)
+        ws4 = writer.sheets["Resumen"]
+        for cell in ws4[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        ws4.column_dimensions["A"].width = 32
+        ws4.column_dimensions["B"].width = 20
+
+    print(f"Excel guardado: {NOMBRE_EXCEL}")
+
+
+def ejecutar():
+    dataset          = {}
+    total            = sum(len(z) * len(TERMINOS) for z in ZONAS.values())
+    comp             = 0
+    rechazados_total = 0
+
+    print("Iniciando recoleccion Antioquia — municipios Argos")
+    print(f"Municipios: {len(ZONAS)} | Busquedas: {total}")
+    print(f"Tiempo estimado: ~{round(total * 1.3 / 60, 1)} minutos")
+    print()
+
+    for ciudad_key, zonas in ZONAS.items():
+        nuevos_ciudad   = 0
+        ciudad_display  = NOMBRES_CIUDAD.get(ciudad_key, ciudad_key)
+
+        for zona in zonas:
+            for termino in TERMINOS:
+                query = f"{termino} en {zona}, Colombia"
+                comp += 1
+                pct   = comp / total * 100
+
+                resultados, rechazados = consultar_api(query, ciudad_key)
+                rechazados_total      += rechazados
+                nuevos = sum(1 for r in resultados
+                             if r["place_id"] not in dataset)
+                for r in resultados:
+                    dataset[r["place_id"]] = r
+                nuevos_ciudad += nuevos
+
+                print(f"[{pct:5.1f}%] {ciudad_display:<28} -> {nuevos:2} nuevos "
+                      f"({rechazados} rechazados)")
+                time.sleep(1.2)
+
+        print(f"  Subtotal {ciudad_display}: {nuevos_ciudad} | "
+              f"Acumulado: {len(dataset)}")
+        print()
+
+    if not dataset:
+        print("Sin resultados.")
+        return
+
+    df = pd.DataFrame(list(dataset.values()))
+
+    # Verificar que no haya ciudades truncadas
+    ciudades_sospechosas = [
+        c for c in df["ciudad"].unique()
+        if isinstance(c, str) and len(c.split()) == 1 and len(c) <= 5
+        and c not in {"Bello", "Turbo", "Urrao", "Penol"}
+    ]
+    if ciudades_sospechosas:
+        print(f"ADVERTENCIA: Ciudades posiblemente truncadas: {ciudades_sospechosas}")
+
+    df.to_csv(NOMBRE_CSV, index=False, encoding="utf-8-sig")
+    guardar_excel(df)
+
+    print(f"\n{'='*55}")
+    print("RECOLECCION COMPLETADA")
+    print(f"Total unicos:    {len(df)}")
+    print(f"Rechazados:      {rechazados_total}")
+    print(f"Con telefono:    {(df['telefono'].fillna('') != '').sum()}")
+    print(f"Municipios:      {df['ciudad'].nunique()}")
+    print()
+    print("Top 10 municipios:")
+    print(df["ciudad"].value_counts().head(10).to_string())
+    print()
+    print(f"CSV:   {NOMBRE_CSV}")
+    print(f"Excel: {NOMBRE_EXCEL}")
+
+
+if __name__ == "__main__":
+    ejecutar()

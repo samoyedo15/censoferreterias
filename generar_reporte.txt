@@ -1,0 +1,179 @@
+"""
+Generador de Reporte de Mercado — Cementos Argos
+Lee el CSV de inteligencia comercial y genera un informe ejecutivo con Groq
+Funciona con cualquier ciudad — detecta automaticamente el CSV mas reciente
+Beca Ser ANDI · EAFIT
+"""
+
+import os
+import glob
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+from datetime import datetime
+
+load_dotenv()
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_KEY:
+    raise ValueError("GROQ_API_KEY no encontrada en .env")
+
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Detectar automaticamente el CSV de inteligencia mas reciente
+# Si hay varios, usa el modificado mas recientemente
+def detectar_csv():
+    candidatos = glob.glob("inteligencia_comercial_*.csv")
+    if not candidatos:
+        candidatos = glob.glob("inteligencia_*.csv")
+    if not candidatos:
+        return None
+    return max(candidatos, key=os.path.getmtime)
+
+ARCHIVO_CSV = detectar_csv()
+
+if not ARCHIVO_CSV:
+    print("No se encontro ningun CSV de inteligencia comercial.")
+    print("CSVs disponibles:")
+    for f in glob.glob("*.csv"):
+        print(f"  {f}")
+    exit(1)
+
+# Nombre del reporte basado en el CSV de entrada
+ARCHIVO_SALIDA = ARCHIVO_CSV.replace("inteligencia_comercial_", "reporte_mercado_").replace(".csv", ".txt")
+
+
+def construir_resumen(df):
+    """Extrae las metricas clave del dataset para el prompt de Groq."""
+    total      = len(df)
+    if total == 0:
+        return "Dataset vacio."
+
+    municipios = df["ciudad"].nunique() if "ciudad" in df.columns else 0
+    alta       = (df.get("vende_cemento_probable", pd.Series()) == "Alta").sum()
+    media      = (df.get("vende_cemento_probable", pd.Series()) == "Media").sum()
+    baja       = (df.get("vende_cemento_probable", pd.Series()) == "Baja").sum()
+    competencia= (df.get("tipo_cliente_argos", pd.Series()) == "Cliente de competencia").sum()
+    propios    = (df.get("tipo_cliente_argos", pd.Series()) == "Punto Argos propio").sum()
+    prioritarios=(df.get("score_potencial_argos", pd.Series(dtype=float)) >= 60).sum()
+    construrama= df.get("nombre_original", df.get("nombre", pd.Series())).str.lower().str.contains(
+                    "construrama", na=False).sum()
+    sin_tel    = (df.get("tiene_telefono", pd.Series()) == "No").sum() if "tiene_telefono" in df.columns \
+                    else (df.get("telefono", pd.Series()).fillna("") == "").sum()
+    score_prom = round(df.get("score_potencial_argos", pd.Series(dtype=float)).mean(), 1) \
+                    if "score_potencial_argos" in df.columns else 0
+
+    top_ciudades = df["ciudad"].value_counts().head(8).to_string() \
+                    if "ciudad" in df.columns else "No disponible"
+
+    if "score_potencial_argos" in df.columns:
+        col_nombre = next((c for c in ["nombre_comercial_limpio","nombre_original","nombre"]
+                          if c in df.columns), None)
+        top5 = df.nlargest(5, "score_potencial_argos")[
+            [c for c in [col_nombre, "ciudad", "score_potencial_argos", "vende_cemento_probable"]
+             if c and c in df.columns]
+        ].to_string(index=False) if col_nombre else "No disponible"
+    else:
+        top5 = "No disponible"
+
+    return f"""
+Dataset: {ARCHIVO_CSV} | Total ferreterias: {total} | Municipios: {municipios}
+Fecha del reporte: {datetime.now().strftime('%d de %B de %Y')}
+
+POTENCIAL DE CEMENTO:
+Alta probabilidad: {alta} ({round(alta/total*100,1) if total else 0}%)
+Media probabilidad: {media} ({round(media/total*100,1) if total else 0}%)
+Baja probabilidad: {baja} ({round(baja/total*100,1) if total else 0}%)
+
+INTELIGENCIA COMPETITIVA:
+Clientes de competencia detectados: {competencia}
+Construrama (red oficial Cemex): {construrama}
+Puntos Argos propios: {propios}
+
+PRIORIZACION COMERCIAL:
+Prospectos prioritarios (score>=60): {prioritarios}
+Score promedio de potencial: {score_prom}/100
+Sin telefono (completar datos): {sin_tel} ({round(sin_tel/total*100,1) if total else 0}%)
+
+TOP MUNICIPIOS POR FERRETERIAS:
+{top_ciudades}
+
+TOP 5 PROSPECTOS POR SCORE:
+{top5}
+"""
+
+
+def generar_reporte(resumen):
+    """Llama a Groq para generar el informe ejecutivo."""
+    prompt = f"""Eres un analista senior de inteligencia de mercados de Cementos Argos Colombia.
+Acabas de completar un censo digital automatizado de ferreterias usando Google Maps API e inteligencia artificial (Groq + Llama 3.3).
+
+Redacta un informe ejecutivo profesional en espanol con estas 6 secciones:
+
+1. RESUMEN EJECUTIVO (2-3 oraciones con los numeros mas importantes)
+2. HALLAZGOS PRINCIPALES (3-4 hallazgos concretos con numeros del censo)
+3. OPORTUNIDADES COMERCIALES PARA ARGOS (que hacer con los prospectos prioritarios)
+4. AMENAZAS COMPETITIVAS (analisis de Cemex/Construrama y otros detectados)
+5. LIMITACIONES DEL CENSO (que datos faltan o no pudo capturarse)
+6. RECOMENDACIONES DE ESCALAMIENTO NACIONAL (como expandir este sistema a todo Colombia)
+
+Tono: profesional, directo, orientado a decisiones comerciales.
+Extension: 450-500 palabras en total. Usa los datos exactos del censo.
+
+DATOS DEL CENSO:
+{resumen}"""
+
+    r = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Eres un analista de inteligencia comercial experto en el sector cementero colombiano. Redactas informes ejecutivos claros, concisos y orientados a la accion."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1200
+        },
+        timeout=30
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def ejecutar():
+    print(f"Leyendo dataset: {ARCHIVO_CSV}")
+    df = pd.read_csv(ARCHIVO_CSV, encoding="utf-8-sig")
+    print(f"Registros: {len(df)}")
+
+    print("Construyendo resumen del dataset...")
+    resumen = construir_resumen(df)
+
+    print("Generando reporte con Groq (Llama 3.3 70B)...")
+    reporte = generar_reporte(resumen)
+
+    contenido = f"""REPORTE DE INTELIGENCIA DE MERCADO - CANAL FERRETERO
+Cementos Argos | Beca Ser ANDI - EAFIT
+Dataset: {ARCHIVO_CSV}
+Generado automaticamente con IA el {datetime.now().strftime('%d de %B de %Y a las %H:%M')}
+{'='*65}
+
+{reporte}
+"""
+
+    with open(ARCHIVO_SALIDA, "w", encoding="utf-8") as f:
+        f.write(contenido)
+
+    print(f"\n{'='*65}")
+    print(contenido)
+    print(f"Guardado en: {ARCHIVO_SALIDA}")
+
+
+if __name__ == "__main__":
+    ejecutar()

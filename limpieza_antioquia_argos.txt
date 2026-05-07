@@ -1,0 +1,630 @@
+"""
+Inteligencia Comercial + Cruce vs Base Argos — Antioquia
+Groq + Llama 3.3 (gratis) — Al finalizar cruza automaticamente con base Argos
+Beca Ser ANDI · EAFIT
+"""
+
+import re
+import os
+import time
+import json
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font
+
+load_dotenv()
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_KEY:
+    raise ValueError("GROQ_API_KEY no encontrada en .env")
+
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+ARCHIVO_ENTRADA  = "piloto_antioquia_argos_raw.csv"
+ARCHIVO_ARGOS    = "Contactos_Habeas_Data_Antioquia.xlsx"
+ARCHIVO_PROGRESO = "intel_progreso_antioquia_argos.json"
+ARCHIVO_SALIDA   = "inteligencia_antioquia_argos.csv"
+ARCHIVO_EXCEL    = "inteligencia_antioquia_argos.xlsx"
+
+TAMANO_BATCH = 5
+DELAY_BATCH  = 3
+
+ALTA = [
+    "deposito de materiales", "materiales de construccion",
+    "distribuidora", "distribuciones", "construrama",
+    "ferreteria y deposito", "deposito y ferreteria",
+    "ladrimax", "ferremat", "homecenter", "easy",
+    "materiales el titan", "grupo ferretero", "organizacion ferkatio",
+    "deposito la variante", "deposito los londono",
+    "drirefor", "dryrefor",
+]
+MEDIA = [
+    "ferreteria", "ferreelectrico", "almacen",
+    "casa ferretera", "punto amarillo",
+]
+BAJA = [
+    "cerrajeria", "miscelanea", "fijaciones",
+    "encofrado", "cantera", "conconcreto",
+    "constructora", "maderas", "maderera", "electric",
+]
+MARCAS = {
+    "argos":       "Argos",
+    "construrama": "Cemex",
+    "cemex":       "Cemex",
+    "holcim":      "Holcim",
+    "andino":      "Andino",
+}
+RUIDOS = [
+    r"\bS\.?A\.?S\.?\b", r"\bLtda\.?\b", r"\bS\.?A\.?\b",
+    r"\bE\.?U\.?\b", r"\bHnos\.?\b", r"\bZOMAC\b",
+]
+MIN_ES = {"y","e","de","del","la","el","los","las",
+          "en","a","al","con","por","para","o","u"}
+
+# Coordenadas de referencia para filtro geografico
+COORDS = {
+    "Medellin":           (6.2442, -75.5812),
+    "Itagui":             (6.1846, -75.5990),
+    "Envigado":           (6.1749, -75.5850),
+    "Sabaneta":           (6.1505, -75.6177),
+    "Bello":              (6.3397, -75.5570),
+    "Rionegro":           (6.1550, -75.3740),
+    "Guarne":             (6.2800, -75.4500),
+    "Yarumal":            (7.3563, -75.5238),
+    "Caucasia":           (7.9894, -75.1969),
+    "Apartado":           (7.8808, -76.6272),
+    "Turbo":              (8.0995, -76.7257),
+    "Santa Rosa de Osos": (6.6468, -75.4611),
+}
+
+
+def limpiar_nombre(n):
+    if not isinstance(n, str):
+        return ""
+    for p in RUIDOS:
+        n = re.sub(p, " ", n, flags=re.IGNORECASE)
+    n = re.sub(r"\s{2,}", " ", n).strip(" ,.--()")
+    partes, res = n.split(), []
+    for i, p in enumerate(partes):
+        if len(p) <= 4 and p.isupper():
+            res.append(p)
+        elif i > 0 and p.lower() in MIN_ES:
+            res.append(p.lower())
+        else:
+            res.append(p.capitalize())
+    return " ".join(res)
+
+
+def por_reglas(nombre):
+    t = nombre.lower()
+    for kw in BAJA:
+        if kw in t:
+            return {"vende_cemento": "Baja",
+                    "razon": f"Tipo '{kw}' no comercializa cemento",
+                    "por_ia": False}
+    for kw in ALTA:
+        if kw in t:
+            return {"vende_cemento": "Alta",
+                    "razon": f"Contiene '{kw}'",
+                    "por_ia": False}
+    for kw in MEDIA:
+        if kw in t:
+            return {"vende_cemento": "Media",
+                    "razon": "Ferreteria general",
+                    "por_ia": False}
+    return None
+
+
+def detectar_marca(nombre, dir_):
+    t = (nombre + " " + str(dir_)).lower()
+    for k, m in MARCAS.items():
+        if k in t:
+            return m
+    return "Sin identificar"
+
+
+def tipo_cliente(nombre, mc, vende):
+    t = nombre.lower()
+    if mc == "Argos":
+        return "Punto Argos propio"
+    if mc in ("Cemex", "Holcim", "Andino") or "construrama" in t:
+        return "Cliente de competencia"
+    if vende == "Alta":
+        return "Prospecto prioritario"
+    if vende == "Media":
+        return "Prospecto secundario"
+    if vende == "Baja":
+        return "No es cliente objetivo"
+    return "Por validar"
+
+
+def calcular_score(row, vende, tipo, madurez):
+    if tipo == "Punto Argos propio":
+        return 0
+    s = {"Alta": 40, "Media": 20, "Baja": 5, "Desconocido": 10}.get(vende, 0)
+    s += {3: 25, 2: 15, 1: 5}.get(int(madurez), 0)
+    try:
+        r = float(row.get("rating", 0) or 0)
+        s += 15 if r >= 4.5 else 10 if r >= 4.0 else 5 if r >= 3.5 else 0
+    except Exception:
+        pass
+    if str(row.get("telefono", "")).strip():
+        s += 10
+    if tipo == "Cliente de competencia":
+        s = max(s - 20, 0)
+    return min(s, 100)
+
+
+def construir_contexto(r):
+    partes = [f"Nombre: {str(r.get('nombre', '') or '')}"]
+    tipo = str(r.get("tipo_negocio") or "").strip()
+    if tipo:
+        partes.append(f"Tipo: {tipo}")
+    desc = str(r.get("descripcion") or "").strip()
+    if desc:
+        partes.append(f"Descripcion: {desc[:150]}")
+    cats = str(r.get("categorias_google") or "").strip()
+    if cats:
+        partes.append(f"Categorias: {', '.join(cats.split(', ')[:3])}")
+    rating  = str(r.get("rating") or "").strip()
+    num_res = str(r.get("num_resenas") or "").strip()
+    if rating and num_res:
+        partes.append(f"Rating: {rating} ({num_res} resenas)")
+    return " | ".join(partes)
+
+
+def prompt_batch(registros):
+    items = "\n".join(
+        f"{i+1}. {construir_contexto(r)}"
+        for i, r in enumerate(registros)
+    )
+    return (
+        f"Analiza {len(registros)} negocios colombianos para Cementos Argos. "
+        f"Responde SOLO con array JSON con exactamente {len(registros)} objetos.\n\n"
+        f"Campos:\n"
+        f"- vende_cemento: Alta|Media|Baja|Desconocido\n"
+        f"- razon: 1 oracion\n"
+        f"- volumen_sacos: 10-30|30-100|100-500|500+\n"
+        f"- observacion: 1 oracion para el asesor Argos\n\n"
+        f"Negocios:\n{items}"
+    )
+
+
+def llamar_groq(registros):
+    fallback = [{
+        "vende_cemento": "Desconocido",
+        "razon": "Sin respuesta de IA",
+        "volumen_sacos": "Sin dato",
+        "observacion": "Revisar manualmente.",
+        "por_ia": True
+    } for _ in registros]
+
+    for intento in range(1, 4):
+        try:
+            r = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system",
+                         "content": "Analista comercial Cementos Argos Colombia. JSON valido sin texto adicional."},
+                        {"role": "user", "content": prompt_batch(registros)}
+                    ],
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"}
+                },
+                timeout=30
+            )
+            if r.status_code == 429:
+                espera = int(r.headers.get("retry-after", 10))
+                print(f"      Rate limit {espera}s")
+                time.sleep(espera + 1)
+                continue
+
+            r.raise_for_status()
+            texto = r.json()["choices"][0]["message"]["content"].strip()
+            texto = re.sub(r"^```json\s*|\s*```$", "", texto)
+            data  = json.loads(texto)
+
+            if isinstance(data, dict):
+                for key in ["results", "ferreterias", "negocios", "items", "data"]:
+                    if key in data and isinstance(data[key], list):
+                        data = data[key]
+                        break
+                else:
+                    data = [data]
+
+            resultado = []
+            for item in data[:len(registros)]:
+                resultado.append({
+                    "vende_cemento": item.get("vende_cemento", "Desconocido"),
+                    "razon":         item.get("razon", "Clasificado por IA"),
+                    "volumen_sacos": item.get("volumen_sacos", "Sin dato"),
+                    "observacion":   item.get("observacion", ""),
+                    "por_ia":        True
+                })
+            while len(resultado) < len(registros):
+                resultado.append(fallback[0])
+            print(f"      Groq OK")
+            return resultado
+
+        except json.JSONDecodeError as e:
+            print(f"      JSON invalido intento {intento}: {e}")
+        except Exception as e:
+            print(f"      Error intento {intento}: {str(e)[:80]}")
+        time.sleep(3 * intento)
+
+    return fallback
+
+
+# ── CRUCE CON BASE ARGOS ──────────────────────────────────────────────────────
+
+STOPWORDS_CRUCE = {
+    "ferreteria","deposito","materiales","construccion",
+    "sas","ltda","eu","y","de","del","la","el","los","las",
+    "colombia","antioquia","zomac","numero","no","nro"
+}
+
+def normalizar_cruce(texto):
+    if not isinstance(texto, str):
+        return ""
+    t = texto.lower()
+    for a, b in {"a":"a","e":"e","i":"i","o":"o","u":"u","n":"n"}.items():
+        pass
+    reemplazos = {"a":"a","e":"e","i":"i","o":"o","u":"u",
+                  "a":"a","e":"e","i":"i","o":"o","u":"u","n":"n"}
+    reemplazos2 = {"a":"a","e":"e","i":"i","o":"o","u":"u","n":"n"}
+    rep = {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ñ":"n","ü":"u"}
+    for a, b in rep.items():
+        t = t.replace(a, b)
+    t = re.sub(r"[^a-z\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    palabras = [p for p in t.split() if p not in STOPWORDS_CRUCE and len(p) > 1]
+    return " ".join(palabras)
+
+
+def similitud(a, b):
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def match_tel(t1, t2):
+    d1 = re.sub(r"\D", "", str(t1 or ""))[-8:]
+    d2 = re.sub(r"\D", "", str(t2 or ""))[-8:]
+    return bool(d1) and bool(d2) and d1 == d2
+
+
+def cruzar_con_argos(df_censo, df_argos):
+    argos_list = df_argos.to_dict("records")
+    resultados = []
+
+    for _, row in df_censo.iterrows():
+        norm_censo = normalizar_cruce(str(row.get("nombre_comercial_limpio",
+                                                   row.get("nombre", ""))))
+        tel_censo  = str(row.get("telefono", ""))
+
+        mejor_score = 0
+        mejor_match = None
+        metodo      = ""
+
+        for ar in argos_list:
+            norm_argos = normalizar_cruce(str(ar.get("nombre", "")))
+            tel_argos  = str(ar.get("telefono", ""))
+
+            if match_tel(tel_censo, tel_argos):
+                sc, met = 1.0, "Telefono"
+            else:
+                sc, met = similitud(norm_censo, norm_argos), "Nombre"
+
+            if sc > mejor_score:
+                mejor_score, mejor_match, metodo = sc, ar, met
+
+        if mejor_score >= 0.45 or metodo == "Telefono":
+            estado    = "Cliente Argos conocido"
+            confianza = "Alta" if mejor_score >= 0.8 or metodo == "Telefono" else \
+                        "Media" if mejor_score >= 0.6 else "Baja"
+        else:
+            estado, confianza, mejor_match = "Prospecto nuevo", "-", {}
+
+        resultados.append({
+            "estado_cruce":      estado,
+            "confianza_cruce":   confianza,
+            "similitud_nombre":  round(mejor_score, 2),
+            "metodo_match":      metodo,
+            "nombre_en_argos":   mejor_match.get("nombre", ""),
+            "cod_cliente_argos": mejor_match.get("cod_cliente", ""),
+            "contactos_argos":   mejor_match.get("contactos", ""),
+            "habeas_data":       mejor_match.get("habeas_data", ""),
+            "punto_venta_argos": mejor_match.get("punto_venta", ""),
+        })
+
+    return pd.DataFrame(resultados)
+
+
+def cargar_argos():
+    df = pd.read_excel(ARCHIVO_ARGOS, engine="openpyxl")
+    return df.groupby("Nombre de la cuenta").agg(
+        ciudad      =("Poblacion: Poblacion" if "Poblacion: Poblacion" in df.columns
+                      else "Población: Población", "first"),
+        direccion   =("Direccion" if "Direccion" in df.columns
+                      else "Dirección", "first"),
+        telefono    =("Movil" if "Movil" in df.columns
+                      else "Móvil", "first"),
+        contactos   =("Nombre completo",
+                      lambda x: " | ".join(x.dropna().astype(str).tolist())),
+        cod_cliente =("Codigo de cliente" if "Codigo de cliente" in df.columns
+                      else "Código de cliente", "first"),
+        habeas_data =("HABEAS DATA FIRMADO SI / NO", "first"),
+        punto_venta =("Es punto de Venta al Publico" if "Es punto de Venta al Publico" in df.columns
+                      else "Es punto de Venta al Público", "first"),
+    ).reset_index().rename(columns={"Nombre de la cuenta": "nombre"})
+
+
+# ── PIPELINE PRINCIPAL ────────────────────────────────────────────────────────
+
+def ejecutar():
+    if not os.path.exists(ARCHIVO_ENTRADA):
+        csvs = [f for f in os.listdir(".") if f.endswith(".csv")]
+        print(f"No encontre {ARCHIVO_ENTRADA}")
+        print(f"CSVs: {csvs}")
+        return
+
+    df = pd.read_csv(ARCHIVO_ENTRADA, encoding="utf-8-sig")
+    print(f"Registros cargados: {len(df)}")
+
+    df["_n"] = df["nombre"].str.lower().str.replace(
+        r"[^a-z\s]", "", regex=True).str.strip()
+    antes = len(df)
+    df = df.drop_duplicates(subset="_n").drop_duplicates(subset="place_id")
+    df.drop(columns=["_n"], inplace=True)
+    print(f"Duplicados eliminados: {antes - len(df)}")
+
+    progreso = {}
+    if os.path.exists(ARCHIVO_PROGRESO):
+        with open(ARCHIVO_PROGRESO, encoding="utf-8") as f:
+            progreso = json.load(f)
+        fallos = [k for k, v in progreso.items()
+                  if "sin respuesta" in str(v.get("razon","")).lower()]
+        for k in fallos:
+            del progreso[k]
+        print(f"Progreso: {len(progreso)} | Fallos: {len(fallos)}")
+
+    # PASO 1: Reglas
+    print("\nPASO 1 - Clasificando con reglas...")
+    clasif_reglas, para_ia = {}, []
+    for _, row in df.iterrows():
+        pid    = str(row.get("place_id", row["nombre"]))
+        c      = por_reglas(str(row.get("nombre", "")))
+        if c:
+            clasif_reglas[pid] = c
+        elif pid not in progreso:
+            para_ia.append(row)
+    print(f"  Por reglas: {len(clasif_reglas)} | Para Groq: {len(para_ia)}")
+
+    # PASO 2: Groq
+    if para_ia:
+        total_b = (len(para_ia) + TAMANO_BATCH - 1) // TAMANO_BATCH
+        print(f"\nPASO 2 - Groq IA ({total_b} batches)")
+        for i in range(0, len(para_ia), TAMANO_BATCH):
+            batch = para_ia[i:i + TAMANO_BATCH]
+            num   = i // TAMANO_BATCH + 1
+            print(f"\n  Batch {num}/{total_b}:")
+            for r in batch:
+                print(f"    -> {r.get('nombre','')}")
+            resultados = llamar_groq(
+                [r.to_dict() if hasattr(r,"to_dict") else r for r in batch])
+            for row, res in zip(batch, resultados):
+                pid = str(row.get("place_id", row.get("nombre","")))
+                progreso[pid] = res
+                print(f"    [{res['vende_cemento']:12}] {row.get('nombre','')} - {res['volumen_sacos']}")
+            time.sleep(DELAY_BATCH)
+
+        with open(ARCHIVO_PROGRESO, "w", encoding="utf-8") as f:
+            json.dump(progreso, f, ensure_ascii=False, indent=2)
+
+    # PASO 3: Ensamblar
+    print("\nPASO 3 - Ensamblando...")
+    filas = []
+    for _, row in df.iterrows():
+        pid     = str(row.get("place_id", row["nombre"]))
+        nombre  = str(row.get("nombre", ""))
+        dir_    = str(row.get("direccion", ""))
+        madurez = int(row.get("nivel_madurez", 1) or 1)
+
+        if pid in clasif_reglas:
+            c, obs, vol, por_ia = clasif_reglas[pid], progreso.get(pid,{}).get("observacion",""), progreso.get(pid,{}).get("volumen_sacos","Sin dato"), False
+        elif pid in progreso:
+            c = progreso[pid]
+            obs, vol, por_ia = c.get("observacion",""), c.get("volumen_sacos","Sin dato"), c.get("por_ia",True)
+        else:
+            c, obs, vol, por_ia = {"vende_cemento":"Desconocido","razon":"No procesado"}, "Revisar.", "Sin dato", False
+
+        vende = c.get("vende_cemento","Desconocido")
+        mc    = detectar_marca(nombre, dir_)
+        tip   = tipo_cliente(nombre, mc, vende)
+        sc    = calcular_score(row, vende, tip, madurez)
+
+        filas.append({
+            "nombre_comercial_limpio": limpiar_nombre(nombre),
+            "nombre_original":         nombre,
+            "ciudad":                  str(row.get("ciudad","") or ""),
+            "barrio":                  str(row.get("barrio","") or ""),
+            "direccion":               dir_,
+            "lat":                     row.get("lat",""),
+            "lng":                     row.get("lng",""),
+            "telefono":                str(row.get("telefono","") or ""),
+            "website":                 str(row.get("website","") or ""),
+            "descripcion":             str(row.get("descripcion","") or ""),
+            "tipo_negocio_google":     str(row.get("tipo_negocio","") or ""),
+            "rating":                  row.get("rating",""),
+            "num_resenas":             row.get("num_resenas",""),
+            "vende_cemento_probable":  vende,
+            "razon_cemento":           c.get("razon",""),
+            "volumen_estimado_sacos":  vol,
+            "marca_cemento_detectada": mc,
+            "tipo_cliente_argos":      tip,
+            "score_potencial_argos":   sc,
+            "potencial_argos":         "Alto" if sc>=70 else "Medio" if sc>=40 else "Bajo" if sc>=20 else "Sin potencial",
+            "observacion_asesor":      obs,
+            "clasificado_por":         "Groq IA" if por_ia else "Reglas Python",
+            "tiene_telefono":          "Si" if str(row.get("telefono","")).strip() else "No",
+            "place_id":                str(row.get("place_id","") or ""),
+        })
+
+    df_f = pd.DataFrame(filas).sort_values("score_potencial_argos", ascending=False)
+    df_f.to_csv(ARCHIVO_SALIDA, index=False, encoding="utf-8-sig")
+
+    # PASO 4: Cruce con Argos
+    if os.path.exists(ARCHIVO_ARGOS):
+        print("\nPASO 4 - Cruzando con base de datos Argos...")
+        try:
+            df_argos  = cargar_argos()
+            df_cruce  = cruzar_con_argos(df_f, df_argos)
+            df_f      = pd.concat([df_f.reset_index(drop=True),
+                                   df_cruce.reset_index(drop=True)], axis=1)
+            conocidos = (df_f["estado_cruce"] == "Cliente Argos conocido").sum()
+            nuevos    = (df_f["estado_cruce"] == "Prospecto nuevo").sum()
+            print(f"  Clientes Argos encontrados: {conocidos}")
+            print(f"  Prospectos nuevos:           {nuevos}")
+            df_f.to_csv(ARCHIVO_SALIDA, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            print(f"  Error en cruce: {e}")
+    else:
+        print(f"\nPASO 4 - Archivo Argos no encontrado ({ARCHIVO_ARGOS}), saltando cruce.")
+
+    guardar_excel(df_f)
+
+    # Reporte
+    print(f"\n{'='*55}")
+    print("REPORTE FINAL")
+    print(f"Total: {len(df_f)} | IA: {(df_f['clasificado_por']=='Groq IA').sum()} | Reglas: {(df_f['clasificado_por']=='Reglas Python').sum()}")
+    print()
+    print("Vende cemento?")
+    print(df_f["vende_cemento_probable"].value_counts().to_string())
+    print(f"\nArchivos: {ARCHIVO_SALIDA} - {ARCHIVO_EXCEL}")
+
+
+def guardar_excel(df):
+    VERDE    = PatternFill("solid", fgColor="C6EFCE")
+    AMARILLO = PatternFill("solid", fgColor="FFEB9C")
+    ROJO     = PatternFill("solid", fgColor="FFC7CE")
+    NARANJA  = PatternFill("solid", fgColor="FCE4D6")
+    AZUL     = PatternFill("solid", fgColor="BDD7EE")
+    GRIS     = PatternFill("solid", fgColor="F2F2F2")
+
+    with pd.ExcelWriter(ARCHIVO_EXCEL, engine="openpyxl") as writer:
+
+        df.sort_values("score_potencial_argos", ascending=False).to_excel(
+            writer, sheet_name="Todos por score", index=False)
+        ws = writer.sheets["Todos por score"]
+        for cell in ws[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        for i in range(1, len(df.columns)+1):
+            ws.column_dimensions[get_column_letter(i)].width = 24
+
+        col_s = list(df.columns).index("score_potencial_argos") + 1
+        col_v = list(df.columns).index("vende_cemento_probable") + 1
+        col_e = list(df.columns).index("estado_cruce") + 1 if "estado_cruce" in df.columns else None
+        for r in range(2, len(df)+2):
+            try:
+                v = int(ws.cell(r, col_s).value or 0)
+                ws.cell(r, col_s).fill = VERDE if v>=70 else AMARILLO if v>=40 else ROJO
+            except Exception:
+                pass
+            try:
+                v = str(ws.cell(r, col_v).value or "")
+                ws.cell(r, col_v).fill = (VERDE if v=="Alta" else AMARILLO if v=="Media" else NARANJA if v=="Baja" else ROJO)
+            except Exception:
+                pass
+            if col_e:
+                try:
+                    v = str(ws.cell(r, col_e).value or "")
+                    ws.cell(r, col_e).fill = VERDE if v=="Cliente Argos conocido" else GRIS
+                except Exception:
+                    pass
+
+        # Clientes Argos encontrados
+        if "estado_cruce" in df.columns:
+            conocidos = df[df["estado_cruce"] == "Cliente Argos conocido"]
+            conocidos.to_excel(writer, sheet_name="Clientes Argos en censo", index=False)
+            ws2 = writer.sheets["Clientes Argos en censo"]
+            for cell in ws2[1]:
+                cell.fill = VERDE
+                cell.font = Font(bold=True)
+
+            # Prospectos nuevos
+            nuevos = df[df["estado_cruce"] == "Prospecto nuevo"].sort_values(
+                "score_potencial_argos", ascending=False)
+            nuevos.to_excel(writer, sheet_name="Prospectos nuevos Argos", index=False)
+            ws3 = writer.sheets["Prospectos nuevos Argos"]
+            for cell in ws3[1]:
+                cell.fill = ROJO
+                cell.font = Font(bold=True)
+
+        # Prospectos prioritarios
+        p1 = df[df["score_potencial_argos"] >= 70]
+        p1.to_excel(writer, sheet_name="Prospectos prioritarios", index=False)
+        ws4 = writer.sheets["Prospectos prioritarios"]
+        for cell in ws4[1]:
+            cell.fill = VERDE
+            cell.font = Font(bold=True)
+
+        # Resumen
+        total = len(df)
+        conocidos_n = (df.get("estado_cruce","") == "Cliente Argos conocido").sum() if "estado_cruce" in df.columns else 0
+        nuevos_n    = (df.get("estado_cruce","") == "Prospecto nuevo").sum() if "estado_cruce" in df.columns else 0
+
+        resumen = pd.DataFrame({
+            "Indicador": [
+                "Total ferreterias en censo",
+                "Municipios cubiertos",
+                "Clasificadas por Groq IA",
+                "Clasificadas por reglas",
+                "Alta probabilidad cemento",
+                "Media probabilidad",
+                "Baja probabilidad",
+                "Prospectos score >= 70",
+                "Clientes Argos encontrados en censo",
+                "Prospectos NUEVOS para Argos",
+                "Con telefono",
+                "Sin telefono",
+                "Score promedio",
+            ],
+            "Valor": [
+                total,
+                df["ciudad"].nunique() if "ciudad" in df.columns else 0,
+                (df["clasificado_por"]=="Groq IA").sum(),
+                (df["clasificado_por"]=="Reglas Python").sum(),
+                (df["vende_cemento_probable"]=="Alta").sum(),
+                (df["vende_cemento_probable"]=="Media").sum(),
+                (df["vende_cemento_probable"]=="Baja").sum(),
+                (df["score_potencial_argos"]>=70).sum(),
+                conocidos_n,
+                nuevos_n,
+                (df["tiene_telefono"]=="Si").sum(),
+                (df["tiene_telefono"]=="No").sum(),
+                round(df["score_potencial_argos"].mean(),1),
+            ]
+        })
+        resumen.to_excel(writer, sheet_name="Resumen ejecutivo", index=False)
+        ws5 = writer.sheets["Resumen ejecutivo"]
+        for cell in ws5[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        ws5.column_dimensions["A"].width = 42
+        ws5.column_dimensions["B"].width = 18
+
+    print(f"Excel guardado: {ARCHIVO_EXCEL}")
+
+
+if __name__ == "__main__":
+    ejecutar()

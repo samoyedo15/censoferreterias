@@ -1,0 +1,556 @@
+"""
+Cruce de datasets — Censo Google Maps vs Base de datos Argos
+Identifica coincidencias, clientes conocidos y prospectos nuevos
+Beca Ser ANDI · EAFIT
+"""
+
+import pandas as pd
+import re
+import os
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font
+
+# ── Archivos ──────────────────────────────────────────────────────────────────
+ARCHIVO_CENSO   = "inteligencia_antioquia_argos.csv"  # tu censo
+ARCHIVO_ARGOS   = "Contactos_Habeas_Data_Antioquia.xlsx"          # base Argos
+ARCHIVO_SALIDA  = "cruce_censo_vs_argos.xlsx"
+
+# ── Normalización de texto para comparar ─────────────────────────────────────
+
+STOPWORDS = {
+    "ferreteria", "ferreteria", "deposito", "deposito",
+    "materiales", "construccion", "construccion",
+    "sas", "ltda", "eu", "zomac",
+    "y", "de", "del", "la", "el", "los", "las",
+    "colombia", "antioquia", "numero", "no", "nro",
+    "num", "sa", "cia", "spa", "grupo"
+}
+
+# Palabras clave comerciales que SI deben compararse aunque sean comunes
+PALABRAS_CLAVE = {
+    "ferreteria", "deposito", "materiales", "almacen", "distribuidora",
+    "construrama", "punto", "amarillo", "titan", "londono", "drirefor",
+    "dryrefor", "ferkatio", "ferregal", "electroferr", "agroferreteria",
+    "construcenter", "construcentro", "construrafa", "agromazos",
+    "agrosarg", "bodegas", "merkafer", "construfer", "cemadera",
+    "construmark", "ferrocentro", "ferroebanista", "ferromax",
+}
+
+def normalizar(texto: str) -> str:
+    """
+    Normaliza un nombre para comparacion.
+    Conserva palabras clave comerciales aunque esten en stopwords.
+    """
+    if not isinstance(texto, str):
+        return ""
+
+    t = texto.lower()
+
+    # Quitar tildes
+    rep = {chr(225):"a",chr(233):"e",chr(237):"i",chr(243):"o",
+           chr(250):"u",chr(241):"n",chr(252):"u"}
+    for a, b in rep.items():
+        t = t.replace(a, b)
+
+    # Solo letras y espacios
+    t = re.sub(r"[^a-z\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Conservar palabras clave comerciales + quitar stopwords generales
+    palabras = []
+    for p in t.split():
+        if len(p) <= 1:
+            continue
+        if p in PALABRAS_CLAVE:
+            palabras.append(p)  # Siempre conservar palabras clave
+        elif p not in STOPWORDS:
+            palabras.append(p)
+
+    return " ".join(palabras)
+
+
+def es_nombre_persona(texto: str) -> bool:
+    """Detecta si el nombre parece ser una persona natural (apellidos)."""
+    if not isinstance(texto, str):
+        return False
+    # Si tiene 3+ palabras en mayusculas sin palabras clave empresariales
+    palabras = texto.upper().split()
+    palabras_empresa = {"SAS","LTDA","S.A","EU","ZOMAC","SAS.","CIA","S.A.S"}
+    tiene_empresa = any(p in palabras_empresa for p in palabras)
+    tiene_clave   = any(kw in texto.lower() for kw in [
+        "ferret","deposit","material","distribu","almacen","construc",
+        "agro","bodega","comercial","organizacion","grupo","punto"
+    ])
+    return len(palabras) >= 3 and not tiene_empresa and not tiene_clave
+
+
+def similitud_apellidos(nombre_census: str, nombre_argos: str) -> float:
+    """
+    Similitud especial para cuando Argos tiene nombre de persona.
+    Busca si algun apellido del registro Argos aparece en el nombre del censo.
+    Ejemplo: 'RESTREPO PEREZ JAIME' en Argos vs 'Ferreteria Restrepo' en censo
+    """
+    if not es_nombre_persona(nombre_argos):
+        return 0.0
+
+    # Tomar las primeras 2 palabras como apellidos (formato colombiano)
+    apellidos = nombre_argos.lower().split()[:2]
+    nombre_censo_lower = nombre_census.lower()
+
+    rep = {chr(225):"a",chr(233):"e",chr(237):"i",chr(243):"o",
+           chr(250):"u",chr(241):"n",chr(252):"u"}
+    for a,b in rep.items():
+        nombre_censo_lower = nombre_censo_lower.replace(a, b)
+
+    # Si algun apellido aparece en el nombre del negocio del censo
+    coincidencias = sum(1 for ap in apellidos if len(ap) > 3 and ap in nombre_censo_lower)
+    if coincidencias >= 1:
+        return 0.5  # Coincidencia media — apellido encontrado
+    return 0.0
+
+
+def similitud_tokens(a: str, b: str) -> float:
+    """
+    Similitud basada en tokens comunes.
+    Retorna valor entre 0 y 1.
+    """
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    interseccion = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(interseccion) / len(union)
+
+
+def es_nombre_persona(texto: str) -> bool:
+    """Detecta si el nombre parece ser una persona natural."""
+    if not isinstance(texto, str):
+        return False
+    palabras = texto.upper().split()
+    palabras_empresa = {"SAS","LTDA","SA","EU","ZOMAC","CIA","SPA"}
+    tiene_empresa = any(p in palabras_empresa for p in palabras)
+    tiene_clave = any(kw in texto.lower() for kw in [
+        "ferret","deposit","material","distribu","almacen","construc",
+        "agro","bodega","comercial","organizacion","grupo","punto","abarrotes"
+    ])
+    return len(palabras) >= 3 and not tiene_empresa and not tiene_clave
+
+
+def similitud_apellidos(nombre_censo: str, nombre_argos: str) -> float:
+    """
+    Detecta si un apellido del registro Argos aparece en el nombre del censo.
+    Resuelve el caso: 'RESTREPO PEREZ JAIME' en Argos vs 'Ferreteria Restrepo' en censo.
+    """
+    if not es_nombre_persona(nombre_argos):
+        return 0.0
+
+    rep = {chr(225):"a",chr(233):"e",chr(237):"i",chr(243):"o",
+           chr(250):"u",chr(241):"n",chr(252):"u"}
+
+    def limpiar(t):
+        t = str(t).lower()
+        for a,b in rep.items(): t = t.replace(a,b)
+        return re.sub(r"[^a-z\s]", " ", t).strip()
+
+    apellidos = limpiar(nombre_argos).split()[:2]
+    censo_limpio = limpiar(nombre_censo)
+
+    # Requerir que el apellido sea largo (>4 letras) y poco comun
+    # para evitar falsos positivos con apellidos genericos
+    coincidencias = sum(1 for ap in apellidos
+                        if len(ap) > 4 and ap in censo_limpio
+                        and ap not in {"perez","garcia","lopez","gonzalez",
+                                       "rodriguez","martinez","hernandez",
+                                       "sanchez","ramirez","torres","moreno"})
+    if coincidencias >= 1:
+        return 0.65  # Score alto para que supere el umbral solo si es confiable
+    return 0.0
+
+
+def match_telefono(tel_a: str, tel_b: str) -> bool:
+    """Compara los ultimos 8 digitos del telefono."""
+    def solo_digitos(t):
+        return re.sub(r"\D", "", str(t or ""))[-8:]
+    da, db = solo_digitos(tel_a), solo_digitos(tel_b)
+    return bool(da) and bool(db) and da == db
+
+
+# ── Cargar datos ──────────────────────────────────────────────────────────────
+
+def cargar_censo(ruta: str) -> pd.DataFrame:
+    ext = ruta.rsplit(".", 1)[-1].lower()
+    if ext in ("xlsx", "xls"):
+        df = pd.read_excel(ruta, engine="openpyxl")
+    else:
+        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+            try:
+                df = pd.read_csv(ruta, encoding=enc)
+                break
+            except Exception:
+                continue
+    # Estandarizar columnas minimas
+    col_nombre   = next((c for c in df.columns if "nombre" in c.lower()), None)
+    col_ciudad   = next((c for c in df.columns if "ciudad" in c.lower() or "municipio" in c.lower()), None)
+    col_tel      = next((c for c in df.columns if "telefono" in c.lower() or "tel" in c.lower() or "movil" in c.lower()), None)
+    col_dir      = next((c for c in df.columns if "direccion" in c.lower() or "address" in c.lower()), None)
+    col_score    = next((c for c in df.columns if "score" in c.lower()), None)
+    col_cemento  = next((c for c in df.columns if "cemento" in c.lower() and "probable" in c.lower()), None)
+    col_tipo     = next((c for c in df.columns if "tipo_cliente" in c.lower()), None)
+    col_place_id = next((c for c in df.columns if "place_id" in c.lower()), None)
+
+    df_std = pd.DataFrame()
+    df_std["nombre"]    = df[col_nombre].astype(str) if col_nombre else ""
+    df_std["ciudad"]    = df[col_ciudad].astype(str) if col_ciudad else ""
+    df_std["telefono"]  = df[col_tel].astype(str) if col_tel else ""
+    df_std["direccion"] = df[col_dir].astype(str) if col_dir else ""
+    df_std["score"]     = pd.to_numeric(df[col_score], errors="coerce").fillna(0) if col_score else 0
+    df_std["vende_cemento"] = df[col_cemento].astype(str) if col_cemento else ""
+    df_std["tipo_cliente"]  = df[col_tipo].astype(str) if col_tipo else ""
+    df_std["place_id"]      = df[col_place_id].astype(str) if col_place_id else ""
+    df_std["fuente"]    = "Google Maps (Censo)"
+    df_std["_norm"]     = df_std["nombre"].apply(normalizar)
+    return df_std
+
+
+def cargar_argos(ruta: str) -> pd.DataFrame:
+    df = pd.read_excel(ruta, engine="openpyxl")
+
+    # Detectar columna de nombre comercial (Nombre 2)
+    col_nombre2 = next((c for c in df.columns
+        if "nombre 2" in c.lower() or "obra" in c.lower()), None)
+
+    # Colapsar multiples contactos del mismo negocio
+    agg_dict = {
+        "ciudad":         ("Poblaci\u00f3n: Poblaci\u00f3n", "first"),
+        "direccion":      ("Direcci\u00f3n", "first"),
+        "telefono":       ("M\u00f3vil", "first"),
+        "contactos_argos":("Nombre completo",
+                           lambda x: " | ".join(x.dropna().astype(str).tolist())),
+        "cod_cliente":    ("C\u00f3digo de cliente", "first"),
+        "habeas_data":    ("HABEAS DATA FIRMADO SI / NO", "first"),
+        "punto_venta":    ("Es punto de Venta al P\u00fablico", "first"),
+        "num_contactos":  ("Nombre completo", "count"),
+    }
+    if col_nombre2:
+        agg_dict["nombre_comercial"] = (col_nombre2, "first")
+
+    df_neg = df.groupby("Nombre de la cuenta").agg(**agg_dict).reset_index()
+    df_neg = df_neg.rename(columns={"Nombre de la cuenta": "nombre_legal"})
+
+    # CLAVE: muchos clientes Argos son personas naturales cuyo negocio
+    # aparece en Google Maps con nombre comercial diferente al nombre legal.
+    # Ejemplo: "RESTREPO PEREZ JAIME ALFONSO" -> nombre comercial: "FERRETERIA RESTREPO"
+    # Usar nombre comercial cuando existe para mejorar el cruce con Google Maps
+    if "nombre_comercial" in df_neg.columns:
+        df_neg["nombre"] = df_neg.apply(
+            lambda r: r["nombre_comercial"]
+            if pd.notna(r.get("nombre_comercial")) and str(r.get("nombre_comercial", "")).strip()
+            else r["nombre_legal"],
+            axis=1
+        )
+    else:
+        df_neg["nombre"] = df_neg["nombre_legal"]
+
+    df_neg["fuente"] = "Base Argos"
+
+    # Normalizar nombre principal Y nombre legal por separado
+    # El cruce intentara ambos para maximizar coincidencias
+    df_neg["_norm"]       = df_neg["nombre"].apply(normalizar)
+    df_neg["_norm_legal"] = df_neg["nombre_legal"].apply(normalizar)
+
+    print(f"  Total negocios Argos:   {len(df_neg)}")
+    if "nombre_comercial" in df_neg.columns:
+        con_nc = df_neg["nombre_comercial"].notna().sum()
+        print(f"  Con nombre comercial:   {con_nc} (se usara para el cruce)")
+        print(f"  Solo nombre legal:      {len(df_neg) - con_nc}")
+
+    return df_neg
+
+# ── Cruce principal ───────────────────────────────────────────────────────────
+
+def cruzar(df_censo: pd.DataFrame, df_argos: pd.DataFrame,
+           umbral_nombre: float = 0.50) -> pd.DataFrame:
+    """
+    Para cada ferreteria del censo, busca la mejor coincidencia en la base Argos.
+    IMPORTANTE: cada negocio de Argos solo puede coincidir con UN registro del censo
+    (el de mayor similitud) para evitar contar el mismo cliente varias veces.
+    """
+    argos_list = df_argos[["nombre", "ciudad", "telefono", "_norm",
+                            "_norm_legal", "cod_cliente", "contactos_argos",
+                            "habeas_data", "punto_venta",
+                            "nombre_comercial",
+                            "num_contactos"]].to_dict("records")
+
+    # PASO 1: Para cada registro del censo calcular el mejor match en Argos
+    candidatos = []
+    for idx_censo, row in df_censo.iterrows():
+        mejor_score  = 0
+        mejor_match  = None
+        metodo_match = ""
+
+        for argos_row in argos_list:
+            # Criterio 1: telefono
+            if match_telefono(row["telefono"], argos_row["telefono"]):
+                sc, met = 1.0, "Telefono"
+            else:
+                # Criterio 2: similitud nombre principal
+                sc1 = similitud_tokens(row["_norm"], argos_row["_norm"])
+                # Criterio 3: similitud nombre legal
+                sc2 = similitud_tokens(row["_norm"], argos_row.get("_norm_legal", ""))
+                # Criterio 4: apellido del dueno
+                sc3 = similitud_apellidos(row["nombre"], argos_row.get("nombre_legal",
+                      argos_row.get("nombre","")))
+                # Criterio 5: nombre comercial (Nombre 2)
+                sc4 = 0.0
+                nc  = argos_row.get("nombre_comercial", "")
+                if nc and str(nc).strip():
+                    n2_norm = normalizar(str(nc))
+                    sc4 = similitud_tokens(row["_norm"], n2_norm) if n2_norm else 0.0
+
+                sc, met = max(sc1, sc2, sc3, sc4), "Nombre"
+
+            if sc > mejor_score:
+                mejor_score  = sc
+                mejor_match  = argos_row
+                metodo_match = met
+
+        candidatos.append({
+            "idx_censo":    idx_censo,
+            "row":          row,
+            "mejor_score":  mejor_score,
+            "mejor_match":  mejor_match,
+            "metodo_match": metodo_match,
+        })
+
+    # PASO 2: Deduplicar — cada negocio Argos solo puede usarse una vez
+    # Ordenar por score descendente y asignar de mayor a menor
+    candidatos.sort(key=lambda x: x["mejor_score"], reverse=True)
+    argos_usados = set()  # IDs de negocios Argos ya asignados
+    asignaciones = {}     # idx_censo -> (score, match, metodo)
+
+    for c in candidatos:
+        score   = c["mejor_score"]
+        match   = c["mejor_match"]
+        metodo  = c["metodo_match"]
+        idx_c   = c["idx_censo"]
+
+        if score >= umbral_nombre or metodo == "Telefono":
+            # Identificar el negocio Argos por su nombre
+            argos_id = match.get("nombre", "") if match else ""
+
+            if argos_id not in argos_usados:
+                # Este negocio Argos aun no fue asignado — asignar
+                argos_usados.add(argos_id)
+                asignaciones[idx_c] = (score, match, metodo)
+            # Si ya fue asignado a otro registro, este queda como prospecto
+
+    # PASO 3: Construir el DataFrame de resultados
+    resultados = []
+    for idx_censo, row in df_censo.iterrows():
+        if idx_censo in asignaciones:
+            score, mejor_match, metodo_match = asignaciones[idx_censo]
+            estado    = "Cliente Argos conocido"
+            confianza = ("Alta"  if score >= 0.8 or metodo_match == "Telefono" else
+                         "Media" if score >= 0.65 else "Baja")
+        else:
+            score, mejor_match, metodo_match = 0, {}, ""
+            estado    = "Prospecto nuevo"
+            confianza = "-"
+
+        resultados.append({
+            "nombre_censo":       row["nombre"],
+            "ciudad_censo":       row["ciudad"],
+            "telefono_censo":     row["telefono"],
+            "direccion_censo":    row["direccion"],
+            "lat":                row.get("lat", ""),
+            "lng":                row.get("lng", ""),
+            "score_argos":        int(row["score"]),
+            "vende_cemento":      row["vende_cemento"],
+            "tipo_cliente":       row["tipo_cliente"],
+            "estado":             estado,
+            "confianza_match":    confianza,
+            "similitud":          round(score, 2),
+            "metodo_match":       metodo_match,
+            "nombre_argos":       mejor_match.get("nombre", ""),
+            "cod_cliente_argos":  mejor_match.get("cod_cliente", ""),
+            "contactos_argos":    mejor_match.get("contactos_argos", ""),
+            "habeas_data":        mejor_match.get("habeas_data", ""),
+            "punto_venta_argos":  mejor_match.get("punto_venta", ""),
+            "num_contactos_argos":mejor_match.get("num_contactos", 0),
+        })
+
+    return pd.DataFrame(resultados)
+
+# ── Excel de resultados ───────────────────────────────────────────────────────
+
+def guardar_excel(df_cruce: pd.DataFrame, df_censo: pd.DataFrame,
+                  df_argos: pd.DataFrame):
+    VERDE    = PatternFill("solid", fgColor="C6EFCE")
+    AMARILLO = PatternFill("solid", fgColor="FFEB9C")
+    ROJO     = PatternFill("solid", fgColor="FFC7CE")
+    AZUL     = PatternFill("solid", fgColor="BDD7EE")
+    GRIS     = PatternFill("solid", fgColor="F2F2F2")
+
+    conocidos   = df_cruce[df_cruce["estado"] == "Cliente Argos conocido"]
+    nuevos      = df_cruce[df_cruce["estado"] == "Prospecto nuevo"]
+    alta_conf   = conocidos[conocidos["confianza_match"] == "Alta"]
+    media_conf  = conocidos[conocidos["confianza_match"] == "Media"]
+
+    # Ferreterias Argos NO encontradas en el censo
+    nombres_argos_encontrados = set(conocidos["nombre_argos"].str.lower().str.strip())
+    no_en_censo = df_argos[
+        ~df_argos["nombre"].str.lower().str.strip().isin(nombres_argos_encontrados)
+    ]
+
+    with pd.ExcelWriter(ARCHIVO_SALIDA, engine="openpyxl") as writer:
+
+        # Hoja 1: Todos los resultados
+        df_cruce.sort_values(
+            ["estado", "similitud"], ascending=[True, False]
+        ).to_excel(writer, sheet_name="Todos los resultados", index=False)
+        ws = writer.sheets["Todos los resultados"]
+        for cell in ws[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        col_estado = list(df_cruce.columns).index("estado") + 1
+        col_conf   = list(df_cruce.columns).index("confianza_match") + 1
+        for r in range(2, len(df_cruce) + 2):
+            estado_val = ws.cell(r, col_estado).value
+            conf_val   = ws.cell(r, col_conf).value
+            if estado_val == "Cliente Argos conocido":
+                color = VERDE if conf_val == "Alta" else AMARILLO
+            else:
+                color = GRIS
+            for c in range(1, len(df_cruce.columns) + 1):
+                ws.cell(r, c).fill = color
+        for i in range(1, len(df_cruce.columns) + 1):
+            ws.column_dimensions[get_column_letter(i)].width = 28
+
+        # Hoja 2: Clientes Argos encontrados en el censo
+        conocidos.to_excel(writer, sheet_name="Clientes Argos en censo", index=False)
+        ws2 = writer.sheets["Clientes Argos en censo"]
+        for cell in ws2[1]:
+            cell.fill = VERDE
+            cell.font = Font(bold=True)
+
+        # Hoja 3: Prospectos nuevos (no estan en Argos)
+        nuevos_prio = nuevos.sort_values("score_argos", ascending=False)
+        nuevos_prio.to_excel(writer, sheet_name="Prospectos nuevos para Argos", index=False)
+        ws3 = writer.sheets["Prospectos nuevos para Argos"]
+        for cell in ws3[1]:
+            cell.fill = ROJO
+            cell.font = Font(bold=True)
+
+        # Hoja 4: Ferreterias Argos no captadas por el censo
+        no_en_censo[["nombre", "ciudad", "telefono", "direccion",
+                     "contactos_argos", "cod_cliente"]].to_excel(
+            writer, sheet_name="Argos no captadas por censo", index=False)
+        ws4 = writer.sheets["Argos no captadas por censo"]
+        for cell in ws4[1]:
+            cell.fill = AMARILLO
+            cell.font = Font(bold=True)
+
+        # Hoja 5: Resumen ejecutivo
+        cobertura_pct = round(len(conocidos) / len(df_argos) * 100, 1) if len(df_argos) else 0
+        nuevos_pct    = round(len(nuevos) / len(df_censo) * 100, 1) if len(df_censo) else 0
+
+        resumen = pd.DataFrame({
+            "Indicador": [
+                "Total ferreterias en el censo (Google Maps)",
+                "Total clientes en base Argos",
+                "--- CRUCE ---",
+                "Clientes Argos encontrados en el censo",
+                "  - Coincidencia Alta confianza",
+                "  - Coincidencia Media confianza",
+                "  - Coincidencia Baja confianza",
+                "Cobertura del censo sobre base Argos (%)",
+                "--- PROSPECTOS ---",
+                "Prospectos nuevos (no estan en Argos)",
+                "% del censo que son prospectos nuevos",
+                "--- GAPS ---",
+                "Clientes Argos NO captados por el censo",
+                "--- VALOR DEL CENSO ---",
+                "Ferreterias nuevas descubiertas para Argos",
+            ],
+            "Valor": [
+                len(df_censo),
+                len(df_argos),
+                "─────────────────",
+                len(conocidos),
+                len(alta_conf),
+                len(media_conf),
+                len(conocidos) - len(alta_conf) - len(media_conf),
+                f"{cobertura_pct}%",
+                "─────────────────",
+                len(nuevos),
+                f"{nuevos_pct}%",
+                "─────────────────",
+                len(no_en_censo),
+                "─────────────────",
+                len(nuevos),
+            ]
+        })
+        resumen.to_excel(writer, sheet_name="Resumen ejecutivo", index=False)
+        ws5 = writer.sheets["Resumen ejecutivo"]
+        for cell in ws5[1]:
+            cell.fill = AZUL
+            cell.font = Font(bold=True)
+        ws5.column_dimensions["A"].width = 52
+        ws5.column_dimensions["B"].width = 20
+
+    print(f"Excel guardado: {ARCHIVO_SALIDA}")
+
+
+# ── Pipeline principal ────────────────────────────────────────────────────────
+
+def ejecutar():
+    # Verificar archivos
+    for archivo in [ARCHIVO_CENSO, ARCHIVO_ARGOS]:
+        if not os.path.exists(archivo):
+            print(f"No encontre: {archivo}")
+            print(f"Archivos disponibles:")
+            for f in os.listdir("."):
+                if f.endswith((".csv", ".xlsx")):
+                    print(f"  - {f}")
+            return
+
+    print(f"Cargando censo: {ARCHIVO_CENSO}")
+    df_censo = cargar_censo(ARCHIVO_CENSO)
+    print(f"  Ferreterias en censo: {len(df_censo)}")
+
+    print(f"\nCargando base Argos: {ARCHIVO_ARGOS}")
+    df_argos = cargar_argos(ARCHIVO_ARGOS)
+    print(f"  Negocios unicos en Argos: {len(df_argos)}")
+
+    print("\nCruzando datasets...")
+    df_cruce = cruzar(df_censo, df_argos, umbral_nombre=0.50)
+
+    conocidos = df_cruce[df_cruce["estado"] == "Cliente Argos conocido"]
+    nuevos    = df_cruce[df_cruce["estado"] == "Prospecto nuevo"]
+
+    print(f"\n{'='*55}")
+    print("RESULTADOS DEL CRUCE")
+    print(f"Ferreterias en censo:        {len(df_censo)}")
+    print(f"Negocios en base Argos:      {len(df_argos)}")
+    print()
+    print(f"Clientes Argos encontrados:  {len(conocidos)}")
+    print(f"  Alta confianza:            {(conocidos['confianza_match']=='Alta').sum()}")
+    print(f"  Media confianza:           {(conocidos['confianza_match']=='Media').sum()}")
+    print(f"  Baja confianza:            {(conocidos['confianza_match']=='Baja').sum()}")
+    print()
+    print(f"Prospectos NUEVOS para Argos:{len(nuevos)}")
+    print(f"Cobertura del censo sobre Argos: {round(len(conocidos)/len(df_argos)*100,1)}%")
+    print()
+    print("Top 10 prospectos nuevos por score:")
+    top = nuevos.nlargest(10, "score_argos")[
+        ["nombre_censo","ciudad_censo","vende_cemento","score_argos"]
+    ]
+    print(top.to_string(index=False))
+
+    guardar_excel(df_cruce, df_censo, df_argos)
+    print(f"\nArchivo: {ARCHIVO_SALIDA}")
+
+
+if __name__ == "__main__":
+    ejecutar()

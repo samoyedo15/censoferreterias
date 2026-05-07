@@ -1,0 +1,1714 @@
+"""
+Dashboard v2 — Censo Digital de Ferreterias
+Tema oscuro + Radar + KPIs semaforo + Upload CSV
+Cementos Argos | Beca Ser ANDI · EAFIT
+
+Instalar:
+    pip install streamlit folium streamlit-folium plotly python-dotenv
+
+Ejecutar:
+    streamlit run dashboard.py
+"""
+
+import os
+import io
+import glob
+import requests
+import subprocess
+import numpy as np
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import folium
+from streamlit_folium import st_folium
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIGURACION Y TEMA OSCURO
+# ══════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="Censo Ferreterias - Argos",
+    page_icon="🏗️",
+    layout="wide"
+)
+
+# Tema oscuro profesional
+st.markdown("""
+<style>
+    /* Fondo principal oscuro */
+    .stApp { background-color: #0B0F19; }
+    header[data-testid="stHeader"] { background-color: #0B0F19; }
+
+    /* Sidebar oscuro */
+    section[data-testid="stSidebar"] {
+        background-color: #0E1320;
+        border-right: 1px solid #1E293B;
+    }
+    section[data-testid="stSidebar"] .stMarkdown { color: #94A3B8; }
+
+    /* Tarjetas metricas con semaforo */
+    div[data-testid="stMetric"] {
+        background: #0E1320;
+        border-radius: 12px;
+        padding: 14px 18px;
+        border: 1px solid #1E293B;
+        border-left: 4px solid #EA580C;
+    }
+    div[data-testid="stMetric"] label { color: #64748B !important; font-size: 12px !important; }
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] { color: #E2E8F0 !important; font-weight: 700 !important; }
+    div[data-testid="stMetric"] div[data-testid="stMetricDelta"] { color: #10B981 !important; }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { background: #0E1320; border-radius: 10px; padding: 4px; gap: 4px; }
+    .stTabs [data-baseweb="tab"] { color: #64748B; border-radius: 8px; padding: 8px 16px; }
+    .stTabs [aria-selected="true"] { background: #1E293B !important; color: #E2E8F0 !important; }
+
+    /* Textos */
+    .stMarkdown, .stText { color: #CBD5E1; }
+    h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 { color: #E2E8F0 !important; }
+
+    /* DataFrames */
+    .stDataFrame { border-radius: 10px; overflow: hidden; }
+
+    /* Selectbox y inputs */
+    .stSelectbox label, .stSlider label, .stCheckbox label { color: #94A3B8 !important; }
+
+    /* Upload area */
+    .upload-zone {
+        border: 2px dashed #1E293B;
+        border-radius: 12px;
+        padding: 24px;
+        text-align: center;
+        background: #0E1320;
+        transition: border-color 0.2s;
+        margin-bottom: 12px;
+    }
+    .upload-zone:hover { border-color: #EA580C; }
+
+    /* KPI Cards personalizados */
+    .kpi-card {
+        background: #0E1320;
+        border: 1px solid #1E293B;
+        border-radius: 12px;
+        padding: 16px;
+        text-align: center;
+    }
+    .kpi-value { font-size: 28px; font-weight: 800; margin: 4px 0; }
+    .kpi-label { font-size: 11px; color: #64748B; text-transform: uppercase; letter-spacing: 0.5px; }
+    .kpi-green  { color: #10B981; border-left: 4px solid #10B981; }
+    .kpi-amber  { color: #F59E0B; border-left: 4px solid #F59E0B; }
+    .kpi-red    { color: #EF4444; border-left: 4px solid #EF4444; }
+    .kpi-blue   { color: #3B82F6; border-left: 4px solid #3B82F6; }
+    .kpi-orange { color: #EA580C; border-left: 4px solid #EA580C; }
+    .kpi-gray   { color: #94A3B8; border-left: 4px solid #94A3B8; }
+</style>
+""", unsafe_allow_html=True)
+
+# Colores
+COLOR_CEMENTO = {
+    "Alta": "#10B981", "Media": "#F59E0B",
+    "Baja": "#EF4444", "Desconocido": "#64748B"
+}
+COLOR_TIPO = {
+    "Prospecto prioritario":  "#3B82F6",
+    "Prospecto secundario":   "#06B6D4",
+    "Punto Argos propio":     "#10B981",
+    "Cliente de competencia": "#F59E0B",
+    "No es cliente objetivo": "#64748B",
+    "Por validar":            "#6B7280"
+}
+COLOR_MAPA = {
+    # Por probabilidad de cemento
+    "Alta":        "green",
+    "Media":       "orange",
+    "Baja":        "red",
+    "Desconocido": "gray",
+    # Por tipo de cliente
+    "Punto Argos propio":     "darkgreen",
+    "Prospecto prioritario":  "blue",
+    "Prospecto secundario":   "cadetblue",
+    "Cliente de competencia": "orange",
+    "No es cliente objetivo": "gray",
+    "Por validar":            "lightgray",
+}
+PLOTLY_DARK = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(14,19,32,0.8)",
+    font_color="#94A3B8",
+    margin=dict(l=0, r=0, t=30, b=0),
+)
+
+
+# ══════════════════════════════════════════════════════════════════
+# CARGA DE DATOS
+# ══════════════════════════════════════════════════════════════════
+
+@st.cache_data
+def cargar(ruta):
+    ext = ruta.rsplit(".", 1)[-1].lower()
+    if ext in ("xlsx", "xls"):
+        df = pd.read_excel(ruta, engine="openpyxl")
+    else:
+        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+            try:
+                df = pd.read_csv(ruta, encoding=enc)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            df = pd.read_csv(ruta, encoding="latin-1", errors="replace")
+    return df
+
+
+def cargar_bytes(uploaded_file):
+    nombre = uploaded_file.name.lower()
+    if nombre.endswith(".xlsx") or nombre.endswith(".xls"):
+        df = pd.read_excel(uploaded_file, engine="openpyxl")
+    else:
+        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+            try:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, encoding=enc)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, encoding="latin-1", errors="replace")
+    return df
+
+
+def normalizar_columnas(df, mapeo):
+    """Renombra columnas segun el mapeo confirmado por el usuario."""
+    renombrar = {}
+    for campo_std, col_original in mapeo.items():
+        if col_original and col_original in df.columns and col_original != campo_std:
+            renombrar[col_original] = campo_std
+    df = df.rename(columns=renombrar)
+    # Convertir numericos
+    for col in ["lat", "lng", "rating", "num_resenas", "score_potencial_argos"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "score_potencial_argos" in df.columns:
+        df["score_potencial_argos"] = df["score_potencial_argos"].fillna(0)
+    return df
+
+
+# Campos estandar del sistema y sus posibles nombres en archivos externos
+CAMPOS_ESTANDAR = {
+    "nombre_comercial_limpio": {
+        "label": "Nombre / Razon Social",
+        "candidatos": ["nombre_comercial_limpio", "nombre", "name", "razon social",
+                       "razon_social", "empresa", "negocio", "establecimiento",
+                       "nombre_original", "denominacion", "comercio"]
+    },
+    "ciudad": {
+        "label": "Ciudad / Municipio",
+        "candidatos": ["ciudad", "city", "municipio", "localidad", "poblacion"]
+    },
+    "direccion": {
+        "label": "Direccion",
+        "candidatos": ["direccion", "direccion_corta", "address", "calle",
+                       "carrera", "ubicacion"]
+    },
+    "telefono": {
+        "label": "Telefono",
+        "candidatos": ["telefono", "telefono_intl", "phone", "tel",
+                       "movil", "celular", "contacto"]
+    },
+    "barrio": {
+        "label": "Barrio / Sector",
+        "candidatos": ["barrio", "sector", "zona", "neighborhood"]
+    },
+    "lat": {
+        "label": "Latitud",
+        "candidatos": ["lat", "latitud", "latitude"]
+    },
+    "lng": {
+        "label": "Longitud",
+        "candidatos": ["lng", "lon", "longitud", "longitude"]
+    },
+    "rating": {
+        "label": "Rating",
+        "candidatos": ["rating", "calificacion", "score", "estrellas"]
+    },
+    "num_resenas": {
+        "label": "Num. Resenas",
+        "candidatos": ["num_resenas", "resenas", "reviews", "comentarios"]
+    },
+    "website": {
+        "label": "Website",
+        "candidatos": ["website", "pagina web", "pagina_web", "web", "url", "sitio"]
+    },
+    "vende_cemento_probable": {
+        "label": "Vende Cemento",
+        "candidatos": ["vende_cemento_probable", "vende_cemento", "cemento"]
+    },
+    "tipo_cliente_argos": {
+        "label": "Tipo Cliente Argos",
+        "candidatos": ["tipo_cliente_argos", "tipo_cliente", "tipo"]
+    },
+    "score_potencial_argos": {
+        "label": "Score Potencial",
+        "candidatos": ["score_potencial_argos", "score", "potencial", "argos_score"]
+    },
+    "marca_cemento_detectada": {
+        "label": "Marca Cemento",
+        "candidatos": ["marca_cemento_detectada", "marca_cemento", "marca"]
+    },
+    "nombre_original": {
+        "label": "Nombre Original",
+        "candidatos": ["nombre_original", "nombre_raw", "raw_name"]
+    },
+    "observacion_asesor": {
+        "label": "Observacion Asesor",
+        "candidatos": ["observacion_asesor", "observacion", "notas", "comentario"]
+    },
+    "volumen_estimado_sacos": {
+        "label": "Volumen Sacos",
+        "candidatos": ["volumen_estimado_sacos", "volumen_sacos", "volumen"]
+    },
+    "nit": {
+        "label": "NIT",
+        "candidatos": ["nit", "rut", "nif", "id_empresa"]
+    },
+}
+
+
+def detectar_columnas(headers):
+    """Detecta automaticamente que columna corresponde a cada campo."""
+    headers_lower = {h: h.lower().replace("_", " ").replace("-", " ") for h in headers}
+    mapeo = {}
+
+    for campo, config in CAMPOS_ESTANDAR.items():
+        mapeo[campo] = None
+        for candidato in config["candidatos"]:
+            # Match exacto primero
+            for h, h_low in headers_lower.items():
+                if h_low == candidato or h == campo:
+                    mapeo[campo] = h
+                    break
+            if mapeo[campo]:
+                break
+            # Match parcial
+            for h, h_low in headers_lower.items():
+                if candidato in h_low:
+                    mapeo[campo] = h
+                    break
+            if mapeo[campo]:
+                break
+
+    return mapeo
+
+
+def kpi_html(label, value, css_class="kpi-orange"):
+    return f"""
+    <div class="kpi-card {css_class}">
+        <div class="kpi-label">{label}</div>
+        <div class="kpi-value">{value}</div>
+    </div>"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.markdown("## Censo Ferreterias")
+    st.markdown("**Cementos Argos**")
+    st.markdown("Beca Ser ANDI - EAFIT")
+    st.divider()
+
+    # Upload CSV o Excel
+    st.markdown("### Cargar dataset")
+    uploaded = st.file_uploader(
+        "Arrastra un CSV o Excel",
+        type=["csv", "xlsx", "xls"],
+        help="Arrastra cualquier CSV o Excel de inteligencia comercial"
+    )
+
+    st.divider()
+
+    # Selector de archivo local
+    csvs = [f for f in os.listdir(".")
+            if f.endswith(".csv") or f.endswith(".xlsx")]
+    if not csvs and not uploaded:
+        st.error("No hay archivos CSV en esta carpeta.")
+        st.stop()
+
+    if uploaded:
+        df_raw_original = cargar_bytes(uploaded)
+        archivo_nombre = uploaded.name
+    else:
+        archivo = st.selectbox("O selecciona dataset local", csvs,
+            index=next((i for i, f in enumerate(csvs)
+                        if "inteligencia" in f), 0))
+        df_raw_original = cargar(archivo)
+        archivo_nombre = archivo
+
+# ══════════════════════════════════════════════════════════════════
+# VALIDACION DE COLUMNAS
+# ══════════════════════════════════════════════════════════════════
+
+# Detectar columnas automaticamente
+headers = df_raw_original.columns.tolist()
+mapeo_auto = detectar_columnas(headers)
+detectadas = sum(1 for v in mapeo_auto.values() if v is not None)
+
+# Inicializar session_state para el mapeo
+if "mapeo_confirmado" not in st.session_state:
+    st.session_state.mapeo_confirmado = None
+if "ultimo_archivo" not in st.session_state:
+    st.session_state.ultimo_archivo = None
+
+# Si cambia el archivo, resetear el mapeo
+if st.session_state.ultimo_archivo != archivo_nombre:
+    st.session_state.mapeo_confirmado = None
+    st.session_state.ultimo_archivo = archivo_nombre
+
+# Mostrar pantalla de validacion si no se ha confirmado
+if st.session_state.mapeo_confirmado is None:
+    st.markdown("## Mapeo Inteligente de Columnas")
+    st.markdown(
+        f"Se detectaron **{detectadas} de {len(CAMPOS_ESTANDAR)} columnas** "
+        f"automaticamente en `{archivo_nombre}`. "
+        f"Verifica y ajusta si alguna no corresponde."
+    )
+
+    # Mostrar preview de datos
+    with st.expander("Vista previa del archivo (5 filas)", expanded=False):
+        st.dataframe(df_raw_original.head(5), use_container_width=True)
+
+    # Formulario de mapeo
+    st.markdown("### Asignar columnas")
+    opciones_columnas = ["-- No disponible --"] + headers
+
+    mapeo_usuario = {}
+    cols_form = st.columns(2)
+
+    for idx, (campo, config) in enumerate(CAMPOS_ESTANDAR.items()):
+        col = cols_form[idx % 2]
+        with col:
+            valor_auto = mapeo_auto.get(campo)
+            default_idx = 0
+            if valor_auto and valor_auto in headers:
+                default_idx = headers.index(valor_auto) + 1
+
+            seleccion = st.selectbox(
+                config["label"],
+                opciones_columnas,
+                index=default_idx,
+                key=f"col_{campo}"
+            )
+            mapeo_usuario[campo] = seleccion if seleccion != "-- No disponible --" else None
+
+    st.markdown("")
+    detectadas_usuario = sum(1 for v in mapeo_usuario.values() if v is not None)
+
+    c_btn1, c_btn2 = st.columns(2)
+    with c_btn1:
+        if st.button("Confirmar y continuar", type="primary", use_container_width=True):
+            st.session_state.mapeo_confirmado = mapeo_usuario
+            st.rerun()
+    with c_btn2:
+        if st.button("Usar deteccion automatica", use_container_width=True):
+            st.session_state.mapeo_confirmado = mapeo_auto
+            st.rerun()
+
+    st.markdown(
+        f"**{detectadas_usuario} columnas asignadas** de {len(CAMPOS_ESTANDAR)}"
+    )
+    st.stop()  # No mostrar el dashboard hasta que confirme
+
+# Aplicar mapeo confirmado
+df_raw = normalizar_columnas(df_raw_original.copy(), st.session_state.mapeo_confirmado)
+
+# Sidebar: filtros (despues de confirmar mapeo)
+with st.sidebar:
+    st.divider()
+    st.markdown("### Filtros")
+
+    if "ciudad" in df_raw.columns:
+        ciudades = ["Todas"] + sorted(df_raw["ciudad"].dropna().unique().tolist())
+        ciudad_sel = st.selectbox("Municipio", ciudades)
+    else:
+        ciudad_sel = "Todas"
+
+    if "vende_cemento_probable" in df_raw.columns:
+        cems = ["Todos"] + sorted(
+            df_raw["vende_cemento_probable"].dropna().unique().tolist())
+        cemento_sel = st.selectbox("Vende cemento", cems)
+    else:
+        cemento_sel = "Todos"
+
+    if "tipo_cliente_argos" in df_raw.columns:
+        tipos = ["Todos"] + sorted(
+            df_raw["tipo_cliente_argos"].dropna().unique().tolist())
+        tipo_sel = st.selectbox("Tipo cliente", tipos)
+    else:
+        tipo_sel = "Todos"
+
+    if "score_potencial_argos" in df_raw.columns:
+        score_min = st.slider("Score minimo", 0, 100, 0)
+    else:
+        score_min = 0
+
+    # Pipeline
+    st.divider()
+    st.markdown("### Pipeline")
+
+    pilotos = sorted([
+        f.replace("piloto_", "").replace(".py", "")
+        for f in glob.glob("piloto_*.py")
+    ])
+    if not pilotos:
+        pilotos = ["antioquia"]
+
+    ciudad_pipeline = st.selectbox(
+        "Ciudad a procesar", pilotos,
+        format_func=lambda x: x.replace("_", " ").title()
+    )
+    solo_limpieza = st.checkbox("Solo limpieza", value=False)
+    generar_rep = st.checkbox("Generar reporte", value=True)
+
+    ejecutar_btn = st.button("Ejecutar pipeline",
+                             use_container_width=True, type="primary")
+
+    st.caption(f"{len(df_raw)} registros | {archivo_nombre}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# PIPELINE EXECUTION
+# ══════════════════════════════════════════════════════════════════
+
+if ejecutar_btn:
+    script_piloto   = f"python piloto_{ciudad_pipeline}.py"
+    script_limpieza = f"python limpieza_{ciudad_pipeline}.py"
+    if not os.path.exists(f"limpieza_{ciudad_pipeline}.py"):
+        script_limpieza = "python limpieza_final.py"
+
+    pasos = []
+    if not solo_limpieza:
+        pasos.append((f"Recolectando {ciudad_pipeline.title()}", script_piloto))
+    pasos.append((f"Clasificando {ciudad_pipeline.title()} con IA", script_limpieza))
+    if generar_rep:
+        pasos.append(("Generando reporte de mercado", "python generar_reporte.py"))
+
+    with st.sidebar:
+        st.divider()
+        st.markdown("### Estado del pipeline")
+        barra  = st.progress(0, text="Iniciando...")
+        estado = st.empty()
+        logs   = st.expander("Ver logs", expanded=True)
+
+    lineas_log = []
+    errores    = []
+
+    for i, (desc, cmd) in enumerate(pasos):
+        barra.progress(int(i / len(pasos) * 100), text=desc)
+        estado.info(f"Ejecutando: {desc}...")
+
+        # Popen permite leer el output linea por linea en tiempo real
+        proceso = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+        )
+
+        # Leer cada linea mientras el proceso corre y mostrarla inmediatamente
+        while True:
+            linea = proceso.stdout.readline()
+            if not linea and proceso.poll() is not None:
+                break
+            if linea.strip():
+                lineas_log.append(linea.rstrip())
+                with logs:
+                    st.code("\n".join(lineas_log[-30:]))
+
+        proceso.wait()
+        if proceso.returncode != 0:
+            errores.append(desc)
+            with logs:
+                st.error(f"Error en: {desc}")
+
+        barra.progress(int((i + 1) / len(pasos) * 100), text=f"OK: {desc}")
+
+    if errores:
+        estado.error("Errores en: " + ", ".join(errores))
+    else:
+        estado.success("Pipeline completado")
+        barra.progress(100, text="Completado")
+        st.balloons()
+        st.cache_data.clear()
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# FILTROS
+# ══════════════════════════════════════════════════════════════════
+
+df = df_raw.copy()
+if ciudad_sel != "Todas":
+    df = df[df["ciudad"] == ciudad_sel]
+if cemento_sel != "Todos" and "vende_cemento_probable" in df.columns:
+    df = df[df["vende_cemento_probable"] == cemento_sel]
+if tipo_sel != "Todos" and "tipo_cliente_argos" in df.columns:
+    df = df[df["tipo_cliente_argos"] == tipo_sel]
+if "score_potencial_argos" in df.columns:
+    df = df[df["score_potencial_argos"] >= score_min]
+
+
+# ══════════════════════════════════════════════════════════════════
+# HEADER Y KPIs CON SEMAFORO
+# ══════════════════════════════════════════════════════════════════
+
+st.markdown("# 🏗️ Censo Digital de Ferreterias")
+st.markdown(f"**Cementos Argos** | {len(df)} de {len(df_raw)} registros | `{archivo_nombre}`")
+
+# KPIs con colores semaforo
+total = len(df)
+municipios = df["ciudad"].nunique()
+alta = (df.get("vende_cemento_probable", pd.Series()) == "Alta").sum()
+media = (df.get("vende_cemento_probable", pd.Series()) == "Media").sum()
+comp = (df.get("tipo_cliente_argos", pd.Series()) == "Cliente de competencia").sum()
+con_tel = (df["telefono"].fillna("") != "").sum()
+sin_tel = total - con_tel
+score_p = round(df["score_potencial_argos"].mean(), 1) if "score_potencial_argos" in df.columns and total else 0
+prio = (df.get("score_potencial_argos", pd.Series(dtype=float)) >= 70).sum()
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+with c1:
+    st.markdown(kpi_html("Total ferreterias", total, "kpi-blue"), unsafe_allow_html=True)
+with c2:
+    st.markdown(kpi_html("Municipios", municipios, "kpi-blue"), unsafe_allow_html=True)
+with c3:
+    color_alta = "kpi-green" if alta > total * 0.3 else "kpi-amber" if alta > total * 0.15 else "kpi-red"
+    st.markdown(kpi_html("Alta prob. cemento", alta, color_alta), unsafe_allow_html=True)
+with c4:
+    color_comp = "kpi-red" if comp > 5 else "kpi-amber" if comp > 0 else "kpi-green"
+    st.markdown(kpi_html("Competencia", comp, color_comp), unsafe_allow_html=True)
+with c5:
+    color_tel = "kpi-green" if con_tel > total * 0.7 else "kpi-amber" if con_tel > total * 0.4 else "kpi-red"
+    st.markdown(kpi_html("Con telefono", con_tel, color_tel), unsafe_allow_html=True)
+with c6:
+    color_score = "kpi-green" if score_p >= 60 else "kpi-amber" if score_p >= 35 else "kpi-red"
+    st.markdown(kpi_html("Score promedio", score_p, color_score), unsafe_allow_html=True)
+
+st.markdown("")
+
+
+# ══════════════════════════════════════════════════════════════════
+# TABS
+# ══════════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "Mapa", "Graficas", "Prospectos",
+    "Competencia", "Datos", "Asistente IA", "Cruce vs Argos",
+    "Prioridades por ciudad"
+])
+
+
+# ── TAB 1: MAPA ──────────────────────────────────────────────────
+with tab1:
+    st.markdown("### Distribucion geografica")
+
+    col_m, col_l = st.columns([4, 1])
+    with col_l:
+        # Definir color_por PRIMERO antes de usarlo en la leyenda
+        color_por = st.radio("Color por",
+            ["Probabilidad cemento", "Tipo cliente"],
+            label_visibility="collapsed")
+        st.markdown("**Leyenda**")
+        if color_por == "Probabilidad cemento":
+            leyenda_items = [
+                ("#10B981", "Alta prob. cemento"),
+                ("#F59E0B", "Media prob. cemento"),
+                ("#EF4444", "Baja prob. cemento"),
+                ("#64748B", "Sin clasificar"),
+            ]
+        else:
+            leyenda_items = [
+                ("#10B981", "Punto Argos propio"),
+                ("#3B82F6", "Prospecto prioritario"),
+                ("#06B6D4", "Prospecto secundario"),
+                ("#F59E0B", "Cliente de competencia"),
+                ("#64748B", "No es objetivo"),
+                ("#6B7280", "Por validar"),
+            ]
+        for color, label in leyenda_items:
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
+                f'<div style="width:10px;height:10px;border-radius:50%;background:{color};'
+                f'flex-shrink:0;"></div>'
+                f'<span style="font-size:11px;color:#94A3B8;">{label}</span></div>',
+                unsafe_allow_html=True)
+        st.markdown("---")
+
+    with col_m:
+        if "lat" not in df.columns or "lng" not in df.columns:
+            df_m = pd.DataFrame()
+        else:
+            df_m = df.dropna(subset=["lat", "lng"])
+        if df_m.empty:
+            st.warning("El dataset actual no tiene coordenadas geograficas. "
+                       "Carga el CSV de inteligencia comercial para ver el mapa.")
+        else:
+            m = folium.Map(
+                location=[df_m["lat"].mean(), df_m["lng"].mean()],
+                zoom_start=10,
+                tiles="CartoDB dark_matter"
+            )
+            for _, r in df_m.iterrows():
+                if color_por == "Probabilidad cemento":
+                    col = COLOR_MAPA.get(
+                        str(r.get("vende_cemento_probable", "")), "gray")
+                else:
+                    col = COLOR_MAPA.get(
+                        str(r.get("tipo_cliente_argos", "")), "blue")
+
+                nombre = str(r.get("nombre_comercial_limpio", r.get("nombre", "")) or "")
+                score_val = int(r.get("score_potencial_argos", 0) or 0)
+                cemento_val = str(r.get("vende_cemento_probable", "") or "")
+                tipo_val = str(r.get("tipo_cliente_argos", "") or "")
+                tel_val = str(r.get("telefono", "") or "").strip() or "Sin dato"
+                vol_val = str(r.get("volumen_estimado_sacos", "") or "").strip()
+                barrio_val = str(r.get("barrio", "") or "").strip()
+                ciudad_val = str(r.get("ciudad", "") or "")
+
+                vol_html = f"<b>Vol:</b> {vol_val} sacos/mes<br>" if vol_val else ""
+                barrio_html = f" - {barrio_val}" if barrio_val else ""
+                score_color = "green" if score_val >= 70 else "orange" if score_val >= 40 else "red"
+
+                popup = f"""
+                <div style="font-family:sans-serif;min-width:220px;">
+                <b style="font-size:14px;">{nombre}</b><br>
+                <span style="color:#666;">{ciudad_val}{barrio_html}</span><br>
+                <hr style="margin:4px 0;">
+                <b>Score Argos:</b> <span style="color:{score_color};font-weight:bold;">{score_val}/100</span><br>
+                <b>Cemento:</b> {cemento_val}<br>
+                <b>Tipo:</b> {tipo_val}<br>
+                <b>Tel:</b> {tel_val}<br>
+                {vol_html}
+                </div>
+                """
+                folium.CircleMarker(
+                    location=[r["lat"], r["lng"]],
+                    radius=7, color=col,
+                    fill=True, fill_opacity=0.85,
+                    popup=folium.Popup(popup, max_width=280),
+                    tooltip=str(nombre)
+                ).add_to(m)
+
+            st_folium(m, width=800, height=520)
+
+
+# ── TAB 2: GRAFICAS + RADAR ──────────────────────────────────────
+with tab2:
+    st.markdown("### Analisis estadistico")
+
+    g1, g2 = st.columns(2)
+
+    with g1:
+        st.markdown("**Ferreterias por municipio**")
+        por_c = df["ciudad"].value_counts().reset_index()
+        por_c.columns = ["Ciudad", "Total"]
+        fig1 = px.bar(por_c.head(15), x="Total", y="Ciudad",
+                      orientation="h", color="Total",
+                      color_continuous_scale="Oranges", height=400)
+        fig1.update_layout(**PLOTLY_DARK, showlegend=False)
+        st.plotly_chart(fig1, use_container_width=True)
+
+    with g2:
+        st.markdown("**Probabilidad de venta de cemento**")
+        if "vende_cemento_probable" in df.columns:
+            cem = df["vende_cemento_probable"].value_counts().reset_index()
+            cem.columns = ["Categoria", "Total"]
+            cols_pie = [COLOR_CEMENTO.get(c, "#64748B") for c in cem["Categoria"]]
+            fig2 = px.pie(cem, values="Total", names="Categoria",
+                          color_discrete_sequence=cols_pie,
+                          height=400, hole=0.45)
+            fig2.update_traces(textposition="outside", textinfo="percent+label")
+            fig2.update_layout(**PLOTLY_DARK)
+            st.plotly_chart(fig2, use_container_width=True)
+
+    g3, g4 = st.columns(2)
+
+    with g3:
+        # RADAR CHART DE SEGMENTOS (nuevo)
+        if "tipo_cliente_argos" in df.columns:
+            st.markdown("**Radar de tipo de cliente**")
+            tipo_counts = df["tipo_cliente_argos"].value_counts()
+            categorias = tipo_counts.index.tolist()
+            valores = tipo_counts.values.tolist()
+
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=valores + [valores[0]],
+                theta=categorias + [categorias[0]],
+                fill="toself",
+                fillcolor="rgba(234,88,12,0.15)",
+                line=dict(color="#EA580C", width=2),
+                marker=dict(size=6, color="#EA580C"),
+                name="Distribucion"
+            ))
+            fig_radar.update_layout(
+                polar=dict(
+                    bgcolor="rgba(14,19,32,0.8)",
+                    radialaxis=dict(
+                        visible=True,
+                        gridcolor="#1E293B",
+                        linecolor="#1E293B",
+                        tickfont=dict(color="#475569", size=10),
+                    ),
+                    angularaxis=dict(
+                        gridcolor="#1E293B",
+                        linecolor="#1E293B",
+                        tickfont=dict(color="#94A3B8", size=10),
+                    ),
+                ),
+                height=400,
+                **PLOTLY_DARK,
+                showlegend=False,
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+
+    with g4:
+        if "score_potencial_argos" in df.columns:
+            st.markdown("**Distribucion de score de potencial**")
+            fig4 = px.histogram(df, x="score_potencial_argos",
+                                nbins=20,
+                                color_discrete_sequence=["#EA580C"],
+                                height=400)
+            fig4.add_vline(x=70, line_dash="dash",
+                           line_color="#10B981",
+                           annotation_text="Prioritario")
+            fig4.add_vline(x=40, line_dash="dash",
+                           line_color="#F59E0B",
+                           annotation_text="Secundario")
+            fig4.update_layout(**PLOTLY_DARK,
+                               xaxis_title="Score",
+                               yaxis_title="Cantidad")
+            st.plotly_chart(fig4, use_container_width=True)
+
+    # Heatmap
+    if "vende_cemento_probable" in df.columns and df["ciudad"].nunique() > 1:
+        st.markdown("**Cruce: Municipio x Probabilidad de Cemento**")
+        pivot = pd.crosstab(df["ciudad"], df["vende_cemento_probable"])
+        fig5 = px.imshow(pivot, color_continuous_scale="Oranges",
+                         height=max(300, len(pivot) * 22),
+                         text_auto=True)
+        fig5.update_layout(**PLOTLY_DARK)
+        st.plotly_chart(fig5, use_container_width=True)
+
+
+# ── TAB 3: PROSPECTOS ─────────────────────────────────────────────
+with tab3:
+    st.markdown("### Prospectos prioritarios (score >= 70)")
+
+    if "score_potencial_argos" not in df.columns:
+        st.info("Columna score no disponible.")
+    else:
+        pri = df[df["score_potencial_argos"] >= 70].sort_values(
+            "score_potencial_argos", ascending=False)
+
+        if pri.empty:
+            st.info("Sin prospectos >= 70 con los filtros actuales.")
+        else:
+            st.success(f"**{len(pri)} prospectos** listos para visitar")
+
+            cols_p = [c for c in [
+                "nombre_comercial_limpio", "ciudad", "barrio",
+                "telefono", "vende_cemento_probable",
+                "score_potencial_argos", "volumen_estimado_sacos",
+                "observacion_asesor"
+            ] if c in pri.columns]
+
+            st.dataframe(
+                pri[cols_p].rename(columns={
+                    "nombre_comercial_limpio": "Nombre",
+                    "ciudad": "Ciudad", "barrio": "Barrio",
+                    "telefono": "Telefono",
+                    "vende_cemento_probable": "Cemento",
+                    "score_potencial_argos": "Score",
+                    "volumen_estimado_sacos": "Vol. sacos/mes",
+                    "observacion_asesor": "Observacion"
+                }),
+                use_container_width=True, height=450
+            )
+            st.download_button(
+                "Descargar prospectos (CSV)",
+                pri.to_csv(index=False, encoding="utf-8-sig"),
+                "prospectos_prioritarios.csv", "text/csv"
+            )
+
+
+# ── TAB 4: COMPETENCIA ────────────────────────────────────────────
+with tab4:
+    st.markdown("### Inteligencia competitiva")
+
+    if "tipo_cliente_argos" not in df.columns:
+        st.info("Columna tipo_cliente_argos no disponible.")
+    else:
+        comp_df = df[df["tipo_cliente_argos"] == "Cliente de competencia"]
+        construrama = 0
+        if "nombre_original" in df.columns:
+            construrama = df["nombre_original"].str.lower().str.contains(
+                "construrama", na=False).sum()
+
+        ca, cb, cc = st.columns(3)
+        with ca:
+            st.markdown(kpi_html("Competencia detectada", len(comp_df), "kpi-red"),
+                        unsafe_allow_html=True)
+        with cb:
+            st.markdown(kpi_html("Construrama (Red Cemex)", construrama, "kpi-amber"),
+                        unsafe_allow_html=True)
+        with cc:
+            propios = (df["tipo_cliente_argos"] == "Punto Argos propio").sum()
+            st.markdown(kpi_html("Puntos Argos propios", propios, "kpi-green"),
+                        unsafe_allow_html=True)
+
+        st.markdown("")
+
+        if not comp_df.empty:
+            st.markdown("**Detalle:**")
+            cols_c = [c for c in [
+                "nombre_comercial_limpio", "ciudad", "barrio",
+                "telefono", "marca_cemento_detectada",
+                "score_potencial_argos", "observacion_asesor"
+            ] if c in comp_df.columns]
+            st.dataframe(
+                comp_df[cols_c].rename(columns={
+                    "nombre_comercial_limpio": "Nombre",
+                    "ciudad": "Ciudad", "barrio": "Barrio",
+                    "telefono": "Telefono",
+                    "marca_cemento_detectada": "Marca",
+                    "score_potencial_argos": "Score",
+                    "observacion_asesor": "Observacion"
+                }),
+                use_container_width=True
+            )
+
+        if "marca_cemento_detectada" in df.columns:
+            marcas = df[
+                df["marca_cemento_detectada"] != "Sin identificar"
+            ]["marca_cemento_detectada"].value_counts().reset_index()
+            marcas.columns = ["Marca", "Frecuencia"]
+            if not marcas.empty:
+                st.markdown("**Marcas detectadas:**")
+                fig_m = px.bar(marcas, x="Marca", y="Frecuencia",
+                               color_discrete_sequence=["#EF4444"],
+                               height=280)
+                fig_m.update_layout(**PLOTLY_DARK)
+                st.plotly_chart(fig_m, use_container_width=True)
+
+
+# ── TAB 5: DATOS COMPLETOS ────────────────────────────────────────
+with tab5:
+    st.markdown("### Dataset completo")
+
+    busq = st.text_input("Buscar por nombre, ciudad o direccion")
+    df_s = df.copy()
+    if busq:
+        mask = (
+            df_s.get("nombre_comercial_limpio",
+                     pd.Series()).fillna("").str.contains(
+                busq, case=False, na=False) |
+            df_s["ciudad"].fillna("").str.contains(
+                busq, case=False, na=False) |
+            df_s["direccion"].fillna("").str.contains(
+                busq, case=False, na=False)
+        )
+        df_s = df_s[mask]
+
+    st.markdown(f"**{len(df_s)}** registros")
+
+    cols_t = [c for c in [
+        "nombre_comercial_limpio", "ciudad", "barrio",
+        "telefono", "vende_cemento_probable",
+        "tipo_cliente_argos", "score_potencial_argos",
+        "rating", "num_resenas", "website", "direccion"
+    ] if c in df_s.columns]
+
+    orden = "score_potencial_argos" if "score_potencial_argos" in df_s.columns else cols_t[0]
+    st.dataframe(
+        df_s[cols_t].sort_values(orden, ascending=False).rename(columns={
+            "nombre_comercial_limpio": "Nombre",
+            "ciudad": "Ciudad", "barrio": "Barrio",
+            "telefono": "Telefono",
+            "vende_cemento_probable": "Cemento",
+            "tipo_cliente_argos": "Tipo",
+            "score_potencial_argos": "Score",
+            "rating": "Rating",
+            "num_resenas": "Resenas",
+            "website": "Web",
+            "direccion": "Direccion"
+        }),
+        use_container_width=True, height=500
+    )
+
+    st.download_button(
+        "Descargar datos filtrados (CSV)",
+        df_s.to_csv(index=False, encoding="utf-8-sig"),
+        "ferreterias_filtradas.csv", "text/csv"
+    )
+
+
+# ── TAB 6: CHATBOT IA ────────────────────────────────────────────
+with tab6:
+    st.markdown("### Asistente de Inteligencia Comercial")
+    st.markdown("Preguntas sobre el censo en lenguaje natural.")
+
+    GROQ_KEY_CHAT = os.getenv("GROQ_API_KEY", "")
+    if not GROQ_KEY_CHAT:
+        st.warning("GROQ_API_KEY no encontrada en .env")
+    else:
+        def contexto_chat(df):
+            t = len(df)
+            if t == 0:
+                return "Dataset vacio."
+            top_c = df["ciudad"].value_counts().head(5).to_string()
+            alta_n = (df.get("vende_cemento_probable", pd.Series()) == "Alta").sum()
+            media_n = (df.get("vende_cemento_probable", pd.Series()) == "Media").sum()
+            comp_n = (df.get("tipo_cliente_argos", pd.Series()) == "Cliente de competencia").sum()
+            prio_n = (df.get("score_potencial_argos", pd.Series(dtype=float)) >= 70).sum()
+            construrama_n = df.get("nombre_original", pd.Series()).str.lower().str.contains("construrama", na=False).sum()
+            score_avg = round(df.get("score_potencial_argos", pd.Series(dtype=float)).mean(), 1) if "score_potencial_argos" in df.columns else 0
+            sin_t = (df["telefono"].fillna("") == "").sum()
+
+            if "score_potencial_argos" in df.columns:
+                top5 = df.nlargest(5, "score_potencial_argos")[
+                    [c for c in ["nombre_comercial_limpio", "ciudad", "score_potencial_argos", "vende_cemento_probable"]
+                     if c in df.columns]
+                ].to_string(index=False)
+            else:
+                top5 = "No disponible"
+
+            return f"""
+Total: {t} ferreterias | Municipios: {df['ciudad'].nunique()}
+Alta prob. cemento: {alta_n} | Media: {media_n}
+Competencia: {comp_n} | Construrama: {construrama_n}
+Prospectos score>=70: {prio_n} | Score prom: {score_avg}
+Sin telefono: {sin_t}
+Top municipios: {top_c}
+Top 5 prospectos: {top5}"""
+
+        def chat_groq(historial, contexto):
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_KEY_CHAT}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": f"Eres asistente de inteligencia comercial para Cementos Argos Colombia. "
+                                       f"Responde en espanol, conciso, con datos del censo.\n\n"
+                                       f"DATOS:\n{contexto}"
+                        }
+                    ] + historial,
+                    "temperature": 0.3,
+                    "max_tokens": 600
+                },
+                timeout=30
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+        if "historial_chat" not in st.session_state:
+            st.session_state.historial_chat = []
+
+        st.markdown("**Preguntas rapidas:**")
+        ce1, ce2, ce3 = st.columns(3)
+        with ce1:
+            if st.button("Alta probabilidad cemento?"):
+                st.session_state.pregunta_rapida = "Cuantas ferreterias tienen alta probabilidad de vender cemento?"
+        with ce2:
+            if st.button("Municipios con competencia?"):
+                st.session_state.pregunta_rapida = "Cuales son los municipios con mas competencia de Cemex?"
+        with ce3:
+            if st.button("Top 5 prospectos?"):
+                st.session_state.pregunta_rapida = "Cuales son los 5 mejores prospectos para visitar?"
+
+        for msg in st.session_state.historial_chat:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        pregunta_default = st.session_state.pop("pregunta_rapida", "") if "pregunta_rapida" in st.session_state else ""
+        pregunta = st.chat_input("Escribe tu pregunta sobre el censo...")
+        pregunta_final = pregunta or pregunta_default
+
+        if pregunta_final:
+            with st.chat_message("user"):
+                st.write(pregunta_final)
+            st.session_state.historial_chat.append({"role": "user", "content": pregunta_final})
+
+            with st.chat_message("assistant"):
+                with st.spinner("Analizando..."):
+                    try:
+                        ctx = contexto_chat(df)
+                        resp = chat_groq(st.session_state.historial_chat, ctx)
+                        st.write(resp)
+                        st.session_state.historial_chat.append({"role": "assistant", "content": resp})
+                    except Exception as e:
+                        st.error(f"Error: {str(e)[:100]}")
+
+        if st.session_state.historial_chat:
+            if st.button("Limpiar conversacion"):
+                st.session_state.historial_chat = []
+                st.rerun()
+
+
+# ── TAB 7: CRUCE VS BASE ARGOS ───────────────────────────────────
+with tab7:
+    st.markdown("### Cruce del censo con la base de datos de Argos")
+    st.markdown(
+        "Compara tu censo de Google Maps con la base oficial de clientes "
+        "de Argos para identificar clientes conocidos y prospectos nuevos."
+    )
+
+    # Uploader del archivo Argos
+    argos_files = [f for f in os.listdir(".")
+                   if ("habeas" in f.lower() or "argos" in f.lower())
+                   and f.endswith(".xlsx")]
+
+    col_a1, col_a2 = st.columns(2)
+    with col_a1:
+        argos_upload = st.file_uploader(
+            "Cargar base de datos Argos (Excel)",
+            type=["xlsx", "xls"],
+            key="argos_uploader"
+        )
+    with col_a2:
+        if argos_files:
+            argos_local = st.selectbox(
+                "O seleccionar archivo local",
+                ["-- Seleccionar --"] + argos_files
+            )
+        else:
+            argos_local = "-- Seleccionar --"
+            st.info("No hay archivos Excel de Argos en la carpeta.")
+
+    # Cargar base Argos
+    df_argos_raw = None
+    if argos_upload:
+        df_argos_raw = pd.read_excel(argos_upload, engine="openpyxl")
+        st.success(f"Base Argos cargada: {len(df_argos_raw)} contactos")
+    elif argos_local != "-- Seleccionar --":
+        df_argos_raw = pd.read_excel(argos_local, engine="openpyxl")
+        st.success(f"Base Argos cargada: {len(df_argos_raw)} contactos")
+
+    if df_argos_raw is not None:
+
+        def _find_col_argos(cols, keywords):
+            cols_lower = {c: c.lower().replace("_"," ").replace("-"," ") for c in cols}
+            for c, cl in cols_lower.items():
+                if any(k in cl for k in keywords):
+                    return c
+            return None
+
+        col_nombre_argos = _find_col_argos(df_argos_raw.columns, [
+            "nombre de la cuenta","nombre cuenta","razon social","cuenta",
+            "empresa","negocio","establecimiento","nombre"
+        ])
+        col_nombre2   = _find_col_argos(df_argos_raw.columns, ["nombre 2","obra","nombre2"])
+        col_ciudad_a  = _find_col_argos(df_argos_raw.columns, ["poblaci","ciudad","municipio"])
+        col_tel_a     = _find_col_argos(df_argos_raw.columns, ["movil","celular","telefono","phone"])
+        col_dir_a     = _find_col_argos(df_argos_raw.columns, ["direcci","address"])
+        col_contacto  = _find_col_argos(df_argos_raw.columns, ["nombre completo","contacto"])
+        col_cod       = _find_col_argos(df_argos_raw.columns, ["codigo de cliente","cod cliente","codigo"])
+        col_habeas    = _find_col_argos(df_argos_raw.columns, ["habeas"])
+        col_pventa    = _find_col_argos(df_argos_raw.columns, ["punto de venta","punto venta"])
+
+        with st.expander("Columnas detectadas en el archivo Argos", expanded=False):
+            det = {
+                "Nombre/Cuenta":   col_nombre_argos or "No detectada",
+                "Nombre comercial":col_nombre2      or "No detectada",
+                "Ciudad":          col_ciudad_a     or "No detectada",
+                "Telefono":        col_tel_a        or "No detectada",
+            }
+            for campo, columna in det.items():
+                color = "#10B981" if columna != "No detectada" else "#EF4444"
+                st.markdown(
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'padding:3px 0;border-bottom:1px solid #1E293B;">'
+                    f'<span style="color:#94A3B8;">{campo}</span>'
+                    f'<span style="color:{color};font-weight:500;">{columna}</span>'
+                    f'</div>', unsafe_allow_html=True)
+            st.caption("Columnas: " + ", ".join(df_argos_raw.columns.tolist()))
+
+        if not col_nombre_argos:
+            st.error("No se encontro la columna de nombre. Verifica el archivo.")
+        else:
+            # Colapsar por negocio
+            agg_dict = {"num_contactos": (col_nombre_argos, "count")}
+            if col_ciudad_a:   agg_dict["ciudad"]      = (col_ciudad_a, "first")
+            if col_tel_a:      agg_dict["telefono"]    = (col_tel_a, "first")
+            if col_dir_a:      agg_dict["direccion"]   = (col_dir_a, "first")
+            if col_contacto:   agg_dict["contactos"]   = (col_contacto,
+                               lambda x: " | ".join(x.dropna().astype(str).tolist()))
+            if col_cod:        agg_dict["cod_cliente"] = (col_cod, "first")
+            if col_habeas:     agg_dict["habeas_data"] = (col_habeas, "first")
+            if col_pventa:     agg_dict["punto_venta"] = (col_pventa, "first")
+            if col_nombre2:    agg_dict["nombre_comercial"] = (col_nombre2, "first")
+
+            df_argos_neg = df_argos_raw.groupby(col_nombre_argos).agg(
+                **{k: v for k, v in agg_dict.items()}
+            ).reset_index().rename(columns={col_nombre_argos: "nombre"})
+
+            st.info(
+                f"Negocios unicos en Argos: **{len(df_argos_neg)}** | "
+                f"Municipios: **{df_argos_raw[col_ciudad_a].nunique() if col_ciudad_a else 'N/A'}**"
+            )
+
+            st.markdown("#### Configuracion del cruce")
+            c_conf1, c_conf2 = st.columns(2)
+            with c_conf1:
+                umbral = st.slider("Umbral de similitud", 0.20, 0.80, 0.50, 0.05)
+            with c_conf2:
+                usar_telefono = st.checkbox("Usar telefono como criterio", value=True)
+
+            if st.button("Ejecutar cruce", type="primary"):
+                import re as _re
+
+                STOPWORDS_C = {
+                    "ferreteria","deposito","materiales","construccion",
+                    "sas","ltda","eu","y","de","del","la","el","los","las",
+                    "colombia","antioquia","zomac","sa","grupo"
+                }
+
+                def norm_c(texto):
+                    if not isinstance(texto, str): return ""
+                    t = texto.lower()
+                    for a,b in {chr(225):"a",chr(233):"e",chr(237):"i",
+                                 chr(243):"o",chr(250):"u",chr(241):"n"}.items():
+                        t = t.replace(a, b)
+                    t = _re.sub(r"[^a-z\s]", " ", t)
+                    t = _re.sub(r"\s+", " ", t).strip()
+                    return " ".join(p for p in t.split()
+                                    if p not in STOPWORDS_C and len(p) > 1)
+
+                def sim_tok(a, b):
+                    ta, tb = set(a.split()), set(b.split())
+                    if not ta or not tb: return 0.0
+                    return len(ta & tb) / len(ta | tb)
+
+                def match_t(t1, t2):
+                    if not usar_telefono: return False
+                    d1 = _re.sub(r"\D","", str(t1 or ""))[-8:]
+                    d2 = _re.sub(r"\D","", str(t2 or ""))[-8:]
+                    return bool(d1) and bool(d2) and d1 == d2
+
+                # Normalizar base Argos
+                argos_list = df_argos_neg.copy()
+                argos_list["_norm"] = argos_list["nombre"].apply(norm_c)
+                if "nombre_comercial" in argos_list.columns:
+                    argos_list["_norm2"] = argos_list["nombre_comercial"].fillna("").apply(norm_c)
+                argos_list = argos_list.to_dict("records")
+
+                col_nom_censo = ("nombre_comercial_limpio"
+                                 if "nombre_comercial_limpio" in df.columns else "nombre")
+                col_tel_censo = "telefono" if "telefono" in df.columns else None
+
+                # Calcular scores para todos
+                candidatos = []
+                for idx_c, row in df.iterrows():
+                    norm_censo = norm_c(str(row.get(col_nom_censo, "")))
+                    tel_censo  = str(row.get(col_tel_censo, "")) if col_tel_censo else ""
+                    mejor_sc, mejor_ar, metodo = 0, None, ""
+
+                    for ar in argos_list:
+                        if match_t(tel_censo, ar.get("telefono", "")):
+                            sc, met = 1.0, "Telefono"
+                        else:
+                            sc1 = sim_tok(norm_censo, ar["_norm"])
+                            sc2 = sim_tok(norm_censo, ar.get("_norm2", ""))
+                            sc, met = max(sc1, sc2), "Nombre"
+
+                        if sc > mejor_sc:
+                            mejor_sc, mejor_ar, metodo = sc, ar, met
+
+                    candidatos.append({
+                        "idx":       idx_c,
+                        "row":       row,
+                        "score":     mejor_sc,
+                        "match":     mejor_ar,
+                        "metodo":    metodo,
+                    })
+
+                # Deduplicar: cada negocio Argos solo coincide una vez
+                candidatos.sort(key=lambda x: x["score"], reverse=True)
+                argos_usados = set()
+                asignaciones = {}
+                for c in candidatos:
+                    if c["score"] >= umbral or c["metodo"] == "Telefono":
+                        aid = c["match"].get("nombre","") if c["match"] else ""
+                        if aid not in argos_usados:
+                            argos_usados.add(aid)
+                            asignaciones[c["idx"]] = c
+
+                resultados = []
+                for idx_c, row in df.iterrows():
+                    if idx_c in asignaciones:
+                        c      = asignaciones[idx_c]
+                        ar     = c["match"]
+                        estado = "Cliente Argos conocido"
+                        sc     = c["score"]
+                        conf   = ("Alta"  if sc >= 0.8 or c["metodo"] == "Telefono" else
+                                  "Media" if sc >= 0.65 else "Baja")
+                    else:
+                        ar, estado, sc, conf, c = {}, "Prospecto nuevo", 0, "-", {}
+
+                    resultados.append({
+                        "nombre_censo":     str(row.get(col_nom_censo, "")),
+                        "ciudad_censo":     str(row.get("ciudad", "")),
+                        "telefono_censo":   str(row.get("telefono", "") or ""),
+                        "lat":              row.get("lat", ""),
+                        "lng":              row.get("lng", ""),
+                        "score_potencial":  int(row.get("score_potencial_argos", 0) or 0),
+                        "vende_cemento":    str(row.get("vende_cemento_probable", "")),
+                        "estado_cruce":     estado,
+                        "confianza":        conf,
+                        "similitud":        round(sc, 2),
+                        "metodo":           c.get("metodo","") if c else "",
+                        "nombre_en_argos":  ar.get("nombre",""),
+                        "cod_cliente":      str(ar.get("cod_cliente","") or ""),
+                        "contactos_argos":  str(ar.get("contactos","") or ""),
+                        "habeas_data":      str(ar.get("habeas_data","") or ""),
+                        "ciudad_argos":     str(ar.get("ciudad","") or ""),
+                    })
+
+                df_res = pd.DataFrame(resultados)
+                # Convertir lat/lng a numerico
+                df_res["lat"] = pd.to_numeric(df_res["lat"], errors="coerce")
+                df_res["lng"] = pd.to_numeric(df_res["lng"], errors="coerce")
+                st.session_state["resultado_cruce"] = df_res
+
+            # Mostrar resultados
+            if "resultado_cruce" in st.session_state:
+                df_res   = st.session_state["resultado_cruce"]
+                conocidos = df_res[df_res["estado_cruce"] == "Cliente Argos conocido"]
+                nuevos    = df_res[df_res["estado_cruce"] == "Prospecto nuevo"]
+                cobertura = round(len(conocidos) / max(len(df_argos_neg), 1) * 100, 1)
+
+                # KPIs
+                st.markdown("#### Resultados del cruce")
+                r1, r2, r3, r4 = st.columns(4)
+                with r1:
+                    st.markdown(kpi_html("En censo", len(df_res), "kpi-blue"), unsafe_allow_html=True)
+                with r2:
+                    st.markdown(kpi_html("Clientes Argos", len(conocidos), "kpi-green"), unsafe_allow_html=True)
+                with r3:
+                    st.markdown(kpi_html("Prospectos nuevos", len(nuevos), "kpi-orange"), unsafe_allow_html=True)
+                with r4:
+                    st.markdown(kpi_html(f"Cobertura Argos", f"{cobertura}%",
+                                "kpi-green" if cobertura >= 50 else "kpi-amber"), unsafe_allow_html=True)
+
+                st.markdown("")
+                alta_c  = (conocidos["confianza"] == "Alta").sum()
+                media_c = (conocidos["confianza"] == "Media").sum()
+                baja_c  = (conocidos["confianza"] == "Baja").sum()
+                cc1, cc2, cc3 = st.columns(3)
+                with cc1:
+                    st.markdown(kpi_html("Alta confianza", alta_c, "kpi-green"), unsafe_allow_html=True)
+                with cc2:
+                    st.markdown(kpi_html("Media confianza", media_c, "kpi-amber"), unsafe_allow_html=True)
+                with cc3:
+                    st.markdown(kpi_html("Baja confianza", baja_c, "kpi-red"), unsafe_allow_html=True)
+
+                st.markdown("")
+
+                # Graficas
+                gc1, gc2, gc3 = st.columns(3)
+                with gc1:
+                    fig_d = go.Figure(go.Pie(
+                        labels=["Clientes Argos","Prospectos nuevos"],
+                        values=[len(conocidos), len(nuevos)],
+                        hole=0.55, marker_colors=["#10B981","#EA580C"],
+                        textinfo="percent+label"
+                    ))
+                    fig_d.update_layout(**PLOTLY_DARK, height=260, showlegend=False)
+                    fig_d.add_annotation(text=f"{len(df_res)}<br>total",
+                        x=0.5, y=0.5, showarrow=False,
+                        font=dict(size=14, color="#E2E8F0"))
+                    st.plotly_chart(fig_d, use_container_width=True)
+                with gc2:
+                    fig_c = go.Figure(go.Bar(
+                        x=["Alta","Media","Baja"],
+                        y=[alta_c, media_c, baja_c],
+                        marker_color=["#10B981","#F59E0B","#EF4444"],
+                        text=[alta_c, media_c, baja_c], textposition="outside",
+                        textfont_color="#E2E8F0"
+                    ))
+                    fig_c.update_layout(**PLOTLY_DARK, height=260,
+                                        title=dict(text="Confianza", font_color="#E2E8F0"))
+                    st.plotly_chart(fig_c, use_container_width=True)
+                with gc3:
+                    met_c = df_res[df_res["estado_cruce"]=="Cliente Argos conocido"]["metodo"].value_counts()
+                    if not met_c.empty:
+                        fig_m = go.Figure(go.Bar(
+                            x=met_c.index.tolist(), y=met_c.values.tolist(),
+                            marker_color=["#3B82F6","#8B5CF6"],
+                            text=met_c.values.tolist(), textposition="outside",
+                            textfont_color="#E2E8F0"
+                        ))
+                        fig_m.update_layout(**PLOTLY_DARK, height=260,
+                                            title=dict(text="Metodo match", font_color="#E2E8F0"))
+                        st.plotly_chart(fig_m, use_container_width=True)
+
+                # Barras por municipio
+                dist = df_res.groupby(["ciudad_censo","estado_cruce"]).size().unstack(fill_value=0).reset_index()
+                if not dist.empty:
+                    dist["_tot"] = dist.get("Cliente Argos conocido", 0) + dist.get("Prospecto nuevo", 0)
+                    dist = dist.sort_values("_tot", ascending=False).head(20)
+                    fig_dist = go.Figure()
+                    if "Cliente Argos conocido" in dist.columns:
+                        fig_dist.add_bar(x=dist["ciudad_censo"],
+                                         y=dist["Cliente Argos conocido"],
+                                         name="Cliente Argos", marker_color="#10B981")
+                    if "Prospecto nuevo" in dist.columns:
+                        fig_dist.add_bar(x=dist["ciudad_censo"],
+                                         y=dist["Prospecto nuevo"],
+                                         name="Prospecto nuevo", marker_color="#EA580C")
+                    fig_dist.update_layout(**PLOTLY_DARK, barmode="stack",
+                                           height=360, xaxis_tickangle=-35,
+                                           legend=dict(font_color="#94A3B8"))
+                    st.plotly_chart(fig_dist, use_container_width=True)
+
+                st.divider()
+
+                # Sub-pestanas con mapas
+                sub1, sub2, sub3 = st.tabs([
+                    "Clientes Argos encontrados",
+                    "Prospectos nuevos para Argos",
+                    "Todos los resultados"
+                ])
+
+                with sub1:
+                    st.markdown(f"**{len(conocidos)} clientes** de la base Argos detectados en el censo")
+
+                    # Mapa de clientes con coordenadas
+                    mapa_c = conocidos.dropna(subset=["lat","lng"])
+                    mapa_c = mapa_c[(mapa_c["lat"] != 0) & (mapa_c["lng"] != 0)]
+                    if not mapa_c.empty:
+                        m_c = folium.Map(
+                            location=[mapa_c["lat"].mean(), mapa_c["lng"].mean()],
+                            zoom_start=8, tiles="CartoDB dark_matter"
+                        )
+                        for _, r in mapa_c.iterrows():
+                            conf    = str(r.get("confianza",""))
+                            color_m = "#10B981" if conf=="Alta" else "#F59E0B" if conf=="Media" else "#EF4444"
+                            nombre_d = str(r.get("nombre_censo",""))
+                            popup_h = (
+                                f"<div style='font-family:sans-serif;min-width:200px;'>"
+                                f"<b>{nombre_d}</b><br>"
+                                f"<span style='color:#666'>{r.get('ciudad_censo','')}</span><br>"
+                                f"<hr style='margin:4px 0;'>"
+                                f"<b>Match Argos:</b> {r.get('nombre_en_argos','')}<br>"
+                                f"<b>Codigo:</b> {r.get('cod_cliente','')}<br>"
+                                f"<b>Confianza:</b> <span style='color:{color_m};'>{conf}</span><br>"
+                                f"<b>Tel:</b> {r.get('telefono_censo','Sin dato')}"
+                                f"</div>"
+                            )
+                            folium.CircleMarker(
+                                location=[r["lat"], r["lng"]],
+                                radius=8, color=color_m,
+                                fill=True, fill_opacity=0.9,
+                                popup=folium.Popup(popup_h, max_width=260),
+                                tooltip=nombre_d
+                            ).add_to(m_c)
+                        st_folium(m_c, width=800, height=400)
+                    else:
+                        st.info("Sin coordenadas disponibles para mostrar en el mapa.")
+
+                    cols_c = [c for c in ["nombre_censo","ciudad_censo","confianza",
+                                          "similitud","metodo","nombre_en_argos",
+                                          "cod_cliente","contactos_argos","habeas_data"]
+                              if c in conocidos.columns]
+                    st.dataframe(conocidos[cols_c].sort_values("similitud", ascending=False),
+                                 use_container_width=True, height=350)
+                    st.download_button("Descargar clientes encontrados (CSV)",
+                        conocidos.to_csv(index=False, encoding="utf-8-sig"),
+                        "clientes_argos_en_censo.csv", "text/csv")
+
+                with sub2:
+                    st.markdown(f"**{len(nuevos)} ferreterias** que Argos NO tiene en su base de datos")
+
+                    # Mapa de prospectos
+                    mapa_n = nuevos.dropna(subset=["lat","lng"])
+                    mapa_n = mapa_n[(mapa_n["lat"] != 0) & (mapa_n["lng"] != 0)]
+                    if not mapa_n.empty:
+                        m_n = folium.Map(
+                            location=[mapa_n["lat"].mean(), mapa_n["lng"].mean()],
+                            zoom_start=8, tiles="CartoDB dark_matter"
+                        )
+                        for _, r in mapa_n.iterrows():
+                            sc_val  = int(r.get("score_potencial", 0) or 0)
+                            color_m = "#EA580C" if sc_val >= 60 else "#F59E0B" if sc_val >= 40 else "#64748B"
+                            nombre_d = str(r.get("nombre_censo",""))
+                            popup_h = (
+                                f"<div style='font-family:sans-serif;min-width:200px;'>"
+                                f"<b>{nombre_d}</b><br>"
+                                f"<span style='color:#666'>{r.get('ciudad_censo','')}</span><br>"
+                                f"<hr style='margin:4px 0;'>"
+                                f"<b>Score:</b> <span style='color:{color_m};font-weight:bold;'>{sc_val}/100</span><br>"
+                                f"<b>Cemento:</b> {r.get('vende_cemento','')}<br>"
+                                f"<b>Tel:</b> {r.get('telefono_censo','Sin dato') or 'Sin dato'}"
+                                f"</div>"
+                            )
+                            folium.CircleMarker(
+                                location=[r["lat"], r["lng"]],
+                                radius=5 + (sc_val // 20),
+                                color=color_m, fill=True, fill_opacity=0.85,
+                                popup=folium.Popup(popup_h, max_width=250),
+                                tooltip=nombre_d
+                            ).add_to(m_n)
+                        st.caption("Radio del punto = score de potencial")
+                        st_folium(m_n, width=800, height=400)
+                    else:
+                        st.info("Sin coordenadas disponibles para el mapa.")
+
+                    # Top prospectos
+                    top_n = nuevos.sort_values("score_potencial", ascending=False).head(15)
+                    if not top_n.empty:
+                        fig_top = go.Figure(go.Bar(
+                            x=top_n["score_potencial"],
+                            y=top_n["nombre_censo"],
+                            orientation="h",
+                            marker_color=["#10B981" if s>=60 else "#F59E0B" if s>=40 else "#64748B"
+                                          for s in top_n["score_potencial"]],
+                            text=top_n["ciudad_censo"],
+                            textposition="inside", textfont_color="white"
+                        ))
+                        fig_top.update_layout(**PLOTLY_DARK, height=480,
+                                              xaxis_title="Score", xaxis=dict(range=[0,100]))
+                        st.plotly_chart(fig_top, use_container_width=True)
+
+                    cols_n = [c for c in ["nombre_censo","ciudad_censo","vende_cemento",
+                                          "score_potencial","telefono_censo"]
+                              if c in nuevos.columns]
+                    st.dataframe(nuevos.sort_values("score_potencial", ascending=False)[cols_n],
+                                 use_container_width=True, height=300)
+                    st.download_button("Descargar prospectos nuevos (CSV)",
+                        nuevos.sort_values("score_potencial", ascending=False).to_csv(
+                            index=False, encoding="utf-8-sig"),
+                        "prospectos_nuevos_argos.csv", "text/csv")
+
+                with sub3:
+                    busq_c = st.text_input("Buscar en resultados del cruce")
+                    df_sc  = df_res.copy()
+                    if busq_c:
+                        mask_c = df_sc.apply(
+                            lambda row: row.astype(str).str.contains(
+                                busq_c, case=False, na=False).any(), axis=1)
+                        df_sc = df_sc[mask_c]
+                    st.markdown(f"**{len(df_sc)}** registros")
+                    st.dataframe(df_sc, use_container_width=True, height=400)
+                    st.download_button("Descargar resultado completo (CSV)",
+                        df_res.to_csv(index=False, encoding="utf-8-sig"),
+                        "cruce_completo.csv", "text/csv")
+
+
+# ── TAB 8: PRIORIDADES POR CIUDAD ────────────────────────────────
+with tab8:
+    st.markdown("### Prioridades comerciales por ciudad")
+    st.markdown(
+        "Vista ejecutiva para el asesor comercial — "
+        "clasifica cada ciudad segun la urgencia de visita."
+    )
+
+    # Definicion de prioridades
+    PRIOS = {
+        "A": {"label": "Atacar ya",     "rango": "Score >= 75", "min": 75,  "max": 101, "color": "#EF4444"},
+        "B": {"label": "Prospectar",    "rango": "Score 55-74", "min": 55,  "max": 75,  "color": "#EA580C"},
+        "C": {"label": "Seguimiento",   "rango": "Score 35-54", "min": 35,  "max": 55,  "color": "#F59E0B"},
+        "D": {"label": "Base fria",     "rango": "Score < 35",  "min": 0,   "max": 35,  "color": "#64748B"},
+    }
+
+    if "score_potencial_argos" not in df.columns or "ciudad" not in df.columns:
+        st.info("Se necesitan las columnas score_potencial_argos y ciudad.")
+    else:
+        df_p = df.copy()
+        df_p["score_potencial_argos"] = pd.to_numeric(
+            df_p["score_potencial_argos"], errors="coerce").fillna(0)
+
+        # Asignar prioridad a cada registro
+        def asignar_prio(s):
+            if s >= 75: return "A"
+            if s >= 55: return "B"
+            if s >= 35: return "C"
+            return "D"
+
+        df_p["prioridad"] = df_p["score_potencial_argos"].apply(asignar_prio)
+
+        # Leyenda de prioridades
+        st.markdown("#### Definicion de prioridades")
+        leg_cols = st.columns(4)
+        for i, (letra, cfg) in enumerate(PRIOS.items()):
+            with leg_cols[i]:
+                st.markdown(
+                    f'<div style="background:#0E1320;border-radius:10px;'
+                    f'padding:14px;border:1.5px solid {cfg["color"]};margin-bottom:8px;">'
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+                    f'<div style="width:12px;height:12px;border-radius:50%;'
+                    f'background:{cfg["color"]};flex-shrink:0;"></div>'
+                    f'<span style="color:{cfg["color"]};font-weight:700;font-size:14px;">'
+                    f'Prioridad {letra} — {cfg["label"]}</span></div>'
+                    f'<div style="color:#94A3B8;font-size:12px;">{cfg["rango"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+        st.markdown("")
+
+        # Calcular metricas por ciudad
+        ciudades_data = []
+        for ciudad in sorted(df_p["ciudad"].dropna().unique()):
+            df_c = df_p[df_p["ciudad"] == ciudad]
+            total_c = len(df_c)
+            if total_c == 0:
+                continue
+
+            conteos = {l: (df_c["prioridad"] == l).sum() for l in PRIOS}
+            score_avg = round(df_c["score_potencial_argos"].mean(), 1)
+            con_tel = (df_c["telefono"].fillna("") != "").sum() if "telefono" in df_c.columns else 0
+            tel_pct = round(con_tel / total_c * 100) if total_c else 0
+
+            ciudades_data.append({
+                "ciudad":    ciudad,
+                "total":     total_c,
+                "score_avg": score_avg,
+                "tel_pct":   tel_pct,
+                "conteos":   conteos,
+            })
+
+        # Ordenar por score promedio descendente
+        ciudades_data.sort(key=lambda x: x["score_avg"], reverse=True)
+
+        # Filtro de ciudad
+        st.markdown("#### Ciudades")
+        min_empresas = st.slider("Mostrar ciudades con al menos N empresas", 1, 20, 1)
+        ciudades_filtradas = [c for c in ciudades_data if c["total"] >= min_empresas]
+        st.markdown(f"Mostrando **{len(ciudades_filtradas)}** ciudades")
+        st.markdown("")
+
+        # Cards por ciudad — 3 columnas
+        for idx in range(0, len(ciudades_filtradas), 3):
+            cols = st.columns(3)
+            for j, col in enumerate(cols):
+                if idx + j >= len(ciudades_filtradas):
+                    break
+                cd = ciudades_filtradas[idx + j]
+                total_c  = cd["total"]
+                conteos  = cd["conteos"]
+                score_avg= cd["score_avg"]
+                tel_pct  = cd["tel_pct"]
+
+                # Barra de progreso con colores de prioridad
+                barra_html = '<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:8px 0 12px;">'
+                for letra, cfg in PRIOS.items():
+                    pct_seg = conteos[letra] / total_c * 100 if total_c else 0
+                    if pct_seg > 0:
+                        barra_html += (
+                            f'<div style="width:{pct_seg:.1f}%;'
+                            f'background:{cfg["color"]};"></div>'
+                        )
+                barra_html += '</div>'
+
+                # Mini KPIs de prioridades A y B
+                prio_html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">'
+                for letra in ["A", "B"]:
+                    cfg   = PRIOS[letra]
+                    cnt   = conteos[letra]
+                    pct_c = round(cnt / total_c * 100) if total_c else 0
+                    prio_html += (
+                        f'<div style="background:#0B0F19;border-radius:8px;padding:8px 10px;">'
+                        f'<div style="display:flex;align-items:center;gap:4px;margin-bottom:2px;">'
+                        f'<div style="width:8px;height:8px;border-radius:50%;background:{cfg["color"]};"></div>'
+                        f'<span style="color:{cfg["color"]};font-size:10px;font-weight:600;">'
+                        f'PRIO {letra} — {cfg["label"].upper()}</span></div>'
+                        f'<div style="color:#E2E8F0;font-size:22px;font-weight:800;line-height:1;">{cnt}</div>'
+                        f'<div style="color:#64748B;font-size:11px;">{pct_c}% del total</div>'
+                        f'</div>'
+                    )
+                prio_html += '</div>'
+
+                # Score y telefono
+                score_color = "#10B981" if score_avg >= 70 else "#F59E0B" if score_avg >= 45 else "#EF4444"
+                tel_color   = "#10B981" if tel_pct >= 70 else "#F59E0B" if tel_pct >= 40 else "#EF4444"
+
+                footer_html = (
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'padding-top:8px;border-top:1px solid #1E293B;">'
+                    f'<span style="color:#64748B;font-size:12px;">Score Argos: '
+                    f'<b style="color:{score_color};">{score_avg}/100</b></span>'
+                    f'<span style="color:#64748B;font-size:12px;">Tel: '
+                    f'<b style="color:{tel_color};">{tel_pct}%</b></span>'
+                    f'</div>'
+                )
+
+                # Card completa
+                card_html = (
+                    f'<div style="background:#0E1320;border-radius:12px;'
+                    f'padding:16px;border:1px solid #1E293B;margin-bottom:12px;">'
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'align-items:center;margin-bottom:4px;">'
+                    f'<span style="color:#E2E8F0;font-size:16px;font-weight:700;">'
+                    f'#{idx+j+1}&nbsp;&nbsp;{cd["ciudad"]}</span>'
+                    f'<span style="color:#64748B;font-size:12px;">{total_c} empresas</span>'
+                    f'</div>'
+                    f'{barra_html}'
+                    f'{prio_html}'
+                    f'{footer_html}'
+                    f'</div>'
+                )
+                col.markdown(card_html, unsafe_allow_html=True)
+
+        # Tabla resumen global
+        st.divider()
+        st.markdown("#### Resumen global de prioridades")
+
+        total_g = len(df_p)
+        res_cols = st.columns(4)
+        for i, (letra, cfg) in enumerate(PRIOS.items()):
+            cnt_g = (df_p["prioridad"] == letra).sum()
+            pct_g = round(cnt_g / total_g * 100) if total_g else 0
+            with res_cols[i]:
+                st.markdown(
+                    f'<div style="background:#0E1320;border-radius:10px;'
+                    f'padding:14px;border-left:4px solid {cfg["color"]};">'
+                    f'<div style="color:#64748B;font-size:11px;text-transform:uppercase;'
+                    f'letter-spacing:0.5px;">Prioridad {letra}</div>'
+                    f'<div style="color:{cfg["color"]};font-size:28px;font-weight:800;">{cnt_g}</div>'
+                    f'<div style="color:#94A3B8;font-size:12px;">{pct_g}% del total | {cfg["label"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+        # Tabla exportable
+        st.markdown("")
+        df_export = pd.DataFrame([{
+            "Ciudad":       cd["ciudad"],
+            "Total":        cd["total"],
+            "Prio A":       cd["conteos"]["A"],
+            "Prio B":       cd["conteos"]["B"],
+            "Prio C":       cd["conteos"]["C"],
+            "Prio D":       cd["conteos"]["D"],
+            "Score Argos":  cd["score_avg"],
+            "% Con Tel":    cd["tel_pct"],
+        } for cd in ciudades_filtradas])
+
+        st.dataframe(df_export, use_container_width=True, height=350)
+        st.download_button(
+            "Descargar tabla de prioridades (CSV)",
+            df_export.to_csv(index=False, encoding="utf-8-sig"),
+            "prioridades_por_ciudad.csv", "text/csv"
+        )
