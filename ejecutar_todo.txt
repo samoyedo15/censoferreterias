@@ -1,0 +1,143 @@
+"""
+Orquestador del pipeline completo — Censo Digital de Ferreterias
+Ejecuta todos los pasos en secuencia desde la terminal
+Uso: python ejecutar_todo.py [ciudad]
+     python ejecutar_todo.py pereira
+     python ejecutar_todo.py antioquia_argos
+Beca Ser ANDI · EAFIT
+"""
+
+import os
+import sys
+import time
+import subprocess
+from datetime import datetime
+
+
+def log(msg, color=""):
+    VERDE   = "\033[92m"
+    NARANJA = "\033[93m"
+    ROJO    = "\033[91m"
+    RESET   = "\033[0m"
+    AZUL    = "\033[94m"
+    colores = {"verde": VERDE, "naranja": NARANJA, "rojo": ROJO, "azul": AZUL}
+    c = colores.get(color, "")
+    print(f"{c}{msg}{RESET}")
+
+
+def ejecutar_paso(nombre, cmd):
+    log(f"\n{'='*55}", "azul")
+    log(f"  {nombre}", "azul")
+    log(f"  Comando: {cmd}", "")
+    log(f"{'='*55}", "azul")
+
+    inicio = time.time()
+
+    proceso = subprocess.Popen(
+        cmd, shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+    )
+
+    while True:
+        linea = proceso.stdout.readline()
+        if not linea and proceso.poll() is not None:
+            break
+        if linea.strip():
+            print(f"  {linea.rstrip()}")
+
+    proceso.wait()
+    duracion = round(time.time() - inicio, 1)
+
+    if proceso.returncode == 0:
+        log(f"\n  OK — {nombre} completado en {duracion} segundos", "verde")
+        return True
+    else:
+        log(f"\n  ERROR en {nombre} (codigo {proceso.returncode})", "rojo")
+        return False
+
+
+def main():
+    # Ciudad por argumento o por defecto antioquia_argos
+    ciudad = sys.argv[1] if len(sys.argv) > 1 else "antioquia_argos"
+
+    log(f"\nCENSO DIGITAL DE FERRETERIAS — CEMENTOS ARGOS", "azul")
+    log(f"Beca Ser ANDI · EAFIT | {datetime.now().strftime('%d/%m/%Y %H:%M')}", "")
+    log(f"Ciudad seleccionada: {ciudad}", "naranja")
+
+    # Verificar que el piloto existe
+    piloto   = f"piloto_{ciudad}.py"
+    limpieza = f"limpieza_{ciudad}.py"
+
+    if not os.path.exists(piloto):
+        log(f"\nError: no se encontro {piloto}", "rojo")
+        pilotos = [f for f in os.listdir(".") if f.startswith("piloto_") and f.endswith(".py")]
+        log(f"Pilotos disponibles: {pilotos}", "naranja")
+        sys.exit(1)
+
+    if not os.path.exists(limpieza):
+        log(f"No se encontro {limpieza} — usando limpieza generica", "naranja")
+        limpieza_cmd = f"python limpieza_final.py"
+    else:
+        limpieza_cmd = f"python {limpieza}"
+
+    # Definir los pasos del pipeline
+    pasos = [
+        (f"PASO 1 — Recoleccion Google Maps ({ciudad})", f"python {piloto}"),
+        (f"PASO 2 — Clasificacion IA Groq",             limpieza_cmd),
+        (f"PASO 3 — Reporte de mercado",                "python generar_reporte.py"),
+    ]
+
+    # Agregar cruce si existe el archivo de Argos
+    archivos_argos = [f for f in os.listdir(".")
+                      if "habeas" in f.lower() and f.endswith(".xlsx")]
+    if archivos_argos or os.path.exists("cruce_datasets.py"):
+        pasos.append(("PASO 4 — Cruce con base Argos", "python cruce_datasets.py"))
+
+    # Ejecutar pipeline
+    inicio_total = time.time()
+    resultados   = []
+
+    for nombre, cmd in pasos:
+        ok = ejecutar_paso(nombre, cmd)
+        resultados.append((nombre, ok))
+        if not ok:
+            log(f"\nPipeline detenido en: {nombre}", "rojo")
+            log("Corrige el error y vuelve a ejecutar.", "rojo")
+            break
+
+    # Reporte final
+    duracion_total = round(time.time() - inicio_total, 1)
+    log(f"\n{'='*55}", "azul")
+    log(f"  RESUMEN DEL PIPELINE", "azul")
+    log(f"{'='*55}", "azul")
+
+    todos_ok = True
+    for nombre, ok in resultados:
+        estado = "OK" if ok else "ERROR"
+        color  = "verde" if ok else "rojo"
+        log(f"  {estado}  {nombre}", color)
+        if not ok:
+            todos_ok = False
+
+    log(f"\n  Tiempo total: {duracion_total} segundos", "")
+
+    if todos_ok:
+        log(f"\n  Pipeline completado. Abriendo dashboard...", "verde")
+        log(f"  streamlit run dashboard.py", "naranja")
+        log(f"{'='*55}\n", "azul")
+        # Abrir el dashboard automaticamente
+        subprocess.Popen(
+            "streamlit run dashboard.py", shell=True,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+        )
+    else:
+        log(f"\n  Pipeline con errores — revisar mensajes arriba", "rojo")
+        log(f"{'='*55}\n", "azul")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
