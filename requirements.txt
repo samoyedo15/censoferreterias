@@ -1,0 +1,23 @@
+# Censo Digital de Ferreterias — Cementos Argos
+# Beca Ser ANDI · EAFIT | Mayo 2026
+#
+# Instalacion completa:
+#   pip install -r requirements.txt
+
+# Dashboard y visualizacion
+streamlit>=1.32.0
+folium>=0.16.0
+streamlit-folium>=0.18.0
+plotly>=5.18.0
+
+# Datos y archivos
+pandas>=2.0.0
+openpyxl>=3.1.0
+numpy>=1.26.0
+
+# APIs y red
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Reportes PDF (opcional — solo para generar_informe_pdf.py)
+reportlab>=4.0.0
